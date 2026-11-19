@@ -3,9 +3,11 @@ const express = require('express');
 const cors = require('cors');
 const { createClient } = require('@supabase/supabase-js');
 const bcrypt = require('bcryptjs');
+const crypto = require('crypto');
 
 const app = express();
 const PORT = process.env.PORT || 5000;
+const JWT_SECRET = process.env.JWT_SECRET || 'wellspring-healthcare-production-secret-token-2026';
 
 // Security & reverse-proxy trust for cloud platforms (Render, Railway, Fly.io, etc.)
 app.set('trust proxy', 1);
@@ -60,6 +62,143 @@ app.use((req, res, next) => {
   next();
 });
 
+// ----------------------------------------------------------------------------
+// Rate Limiter Engine (Sliding Window in Pure Node.js - No External Dependencies)
+// ----------------------------------------------------------------------------
+function createRateLimiter({ windowMs, maxRequests, message }) {
+  const hits = new Map();
+
+  setInterval(() => {
+    const now = Date.now();
+    for (const [ip, data] of hits.entries()) {
+      if (now > data.resetTime) hits.delete(ip);
+    }
+  }, 180000).unref(); // Auto-clean expired records every 3 minutes
+
+  return function (req, res, next) {
+    const ip = req.ip || req.headers['x-forwarded-for'] || req.socket.remoteAddress || 'unknown';
+    const now = Date.now();
+    const record = hits.get(ip);
+
+    if (!record || now > record.resetTime) {
+      hits.set(ip, { count: 1, resetTime: now + windowMs });
+      return next();
+    }
+
+    if (record.count >= maxRequests) {
+      const retryAfter = Math.ceil((record.resetTime - now) / 1000);
+      res.setHeader('Retry-After', retryAfter);
+      return res.status(429).json({
+        error: message || 'Too many requests. Please try again later.',
+        retryAfter
+      });
+    }
+
+    record.count++;
+    next();
+  };
+}
+
+// 1. Strict rate limiter for Login endpoints (15 attempts per 10 minutes)
+const loginLimiter = createRateLimiter({
+  windowMs: 10 * 60 * 1000,
+  maxRequests: 15,
+  message: 'Too many login attempts from this IP. Please wait 10 minutes before retrying.'
+});
+
+// 2. Rate limiter for Dialog SMS gateway (10 SMS dispatches per 5 minutes per IP)
+const smsLimiter = createRateLimiter({
+  windowMs: 5 * 60 * 1000,
+  maxRequests: 10,
+  message: 'SMS rate limit reached. Please wait a few minutes before sending another SMS receipt.'
+});
+
+// 3. General DDoS and scraper protective limiter (400 requests/minute)
+const generalLimiter = createRateLimiter({
+  windowMs: 60 * 1000,
+  maxRequests: 400,
+  message: 'Traffic limit reached. Please slow down.'
+});
+
+app.use(generalLimiter);
+
+// ----------------------------------------------------------------------------
+// Cryptographic JWT Engine (HS256 with Timing-Safe Verification)
+// ----------------------------------------------------------------------------
+function signJWT(payload, expiresInSeconds = 86400) {
+  const header = { alg: 'HS256', typ: 'JWT' };
+  const exp = Math.floor(Date.now() / 1000) + expiresInSeconds;
+  const fullPayload = { ...payload, exp, iat: Math.floor(Date.now() / 1000) };
+
+  const encodedHeader = Buffer.from(JSON.stringify(header)).toString('base64url');
+  const encodedPayload = Buffer.from(JSON.stringify(fullPayload)).toString('base64url');
+
+  const signature = crypto
+    .createHmac('sha256', JWT_SECRET)
+    .update(`${encodedHeader}.${encodedPayload}`)
+    .digest('base64url');
+
+  return `${encodedHeader}.${encodedPayload}.${signature}`;
+}
+
+function verifyJWT(token) {
+  try {
+    if (!token || typeof token !== 'string') return null;
+    const parts = token.split('.');
+    if (parts.length !== 3) return null;
+
+    const [headerB64, payloadB64, signatureB64] = parts;
+
+    const expectedSignature = crypto
+      .createHmac('sha256', JWT_SECRET)
+      .update(`${headerB64}.${payloadB64}`)
+      .digest('base64url');
+
+    const sigBuffer = Buffer.from(signatureB64);
+    const expectedBuffer = Buffer.from(expectedSignature);
+
+    if (sigBuffer.length !== expectedBuffer.length || !crypto.timingSafeEqual(sigBuffer, expectedBuffer)) {
+      return null;
+    }
+
+    const payload = JSON.parse(Buffer.from(payloadB64, 'base64url').toString('utf8'));
+
+    // Check expiration
+    if (payload.exp && Math.floor(Date.now() / 1000) > payload.exp) {
+      return null;
+    }
+
+    return payload;
+  } catch {
+    return null;
+  }
+}
+
+// Authentication & Role-Based Authorization Middleware
+function requireAuth(allowedRoles = []) {
+  return (req, res, next) => {
+    const authHeader = req.headers['authorization'];
+    const token = authHeader && authHeader.startsWith('Bearer ') ? authHeader.slice(7).trim() : null;
+
+    if (!token) {
+      return res.status(401).json({ error: 'Unauthorized: Authentication token required.' });
+    }
+
+    const user = verifyJWT(token);
+    if (!user) {
+      return res.status(401).json({ error: 'Unauthorized: Session has expired or is invalid. Please log in again.' });
+    }
+
+    // Role-based check (ADMIN has universal superadmin access to all routes)
+    if (allowedRoles.length > 0 && !allowedRoles.includes(user.role) && user.role !== 'ADMIN') {
+      return res.status(403).json({ error: `Forbidden: Role '${user.role}' is not authorized for this resource.` });
+    }
+
+    req.user = user;
+    next();
+  };
+}
+
 // Supabase environment variable validation
 const supabaseUrl = process.env.SUPABASE_URL;
 const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
@@ -75,7 +214,7 @@ const supabase = createClient(
 );
 
 // ----------------------------------------------------------------------------
-// Helper Functions
+// Helper Functions (With Concurrency Auto-Retry - P2)
 // ----------------------------------------------------------------------------
 
 // Always get current YYYY-MM-DD in Sri Lanka Time (UTC+5:30), even on cloud servers (UTC)
@@ -106,6 +245,36 @@ async function getNextId(tableName) {
   return data && data.length > 0 ? Number(data[0].id) + 1 : 1;
 }
 
+// Priority 2: Concurrent-Safe Insert with automatic conflict retry on duplicate ID (error 23505)
+async function safeInsertWithId(tableName, recordData, maxRetries = 5) {
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      const nextId = await getNextId(tableName);
+      const payload = { ...recordData, id: nextId };
+
+      const { data, error } = await supabase
+        .from(tableName)
+        .insert([payload])
+        .select()
+        .single();
+
+      if (error) {
+        // PostgreSQL unique violation error code: 23505
+        if (error.code === '23505' && attempt < maxRetries) {
+          console.warn(`[Concurrency Retry] ID collision in table '${tableName}' on ID ${nextId}. Retrying attempt ${attempt + 1}...`);
+          // Random jitter between 15ms - 55ms prevents repeated lockstep collision
+          await new Promise(resolve => setTimeout(resolve, Math.floor(Math.random() * 40) + 15));
+          continue;
+        }
+        throw error;
+      }
+      return data;
+    } catch (err) {
+      if (attempt >= maxRetries) throw err;
+    }
+  }
+}
+
 // ----------------------------------------------------------------------------
 // Health Check & Root Endpoints (Required & Monitored by Render)
 // ----------------------------------------------------------------------------
@@ -127,7 +296,7 @@ app.get('/', (req, res) => {
 });
 
 // ----------------------------------------------------------------------------
-// SYSTEM ROUTE: Public Clinic Stats & Doctor Telemetry
+// SYSTEM ROUTE: Public Clinic Stats & Doctor Telemetry (Landing Page)
 // ----------------------------------------------------------------------------
 app.get('/api/system/public-stats', async (req, res) => {
   try {
@@ -163,9 +332,9 @@ app.get('/api/system/public-stats', async (req, res) => {
 });
 
 // ============================================================================
-// ROUTE 1: Encrypted Doctor Portal Login
+// ROUTE 1: Encrypted Doctor Portal Login (Rate-Limited + Issues JWT)
 // ============================================================================
-app.post('/api/doctor/login', async (req, res) => {
+app.post('/api/doctor/login', loginLimiter, async (req, res) => {
   try {
     const { username, password } = req.body;
 
@@ -173,7 +342,6 @@ app.post('/api/doctor/login', async (req, res) => {
       return res.status(400).json({ error: 'Username and password are required.' });
     }
 
-    // 1. Fetch the user by username
     const { data: doctor, error } = await supabase
       .from('doctors_master')
       .select('id, name, specialty, reg_number, username, password, flag')
@@ -181,31 +349,35 @@ app.post('/api/doctor/login', async (req, res) => {
       .eq('flag', 1)
       .single();
 
-    // If no user found or database error
     if (error || !doctor) {
       return res.status(401).json({ error: 'Invalid username or password.' });
     }
 
-    // 2. Compare the typed password with the encrypted hash in the database
     const isMatch = await bcrypt.compare(password, doctor.password);
-
     if (!isMatch) {
       return res.status(401).json({ error: 'Invalid username or password.' });
     }
 
-    // 3. Mark doctor as online
     await supabase
       .from('doctors_master')
       .update({ is_online: true })
       .eq('id', doctor.id);
 
-    // Send data back without the password
+    const token = signJWT({
+      id: doctor.id,
+      name: doctor.name,
+      username: doctor.username,
+      role: 'DOCTOR'
+    });
+
     res.json({
       id: doctor.id,
       name: doctor.name,
       specialty: doctor.specialty,
       reg_number: doctor.reg_number,
-      username: doctor.username
+      username: doctor.username,
+      role: 'DOCTOR',
+      token
     });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -214,19 +386,19 @@ app.post('/api/doctor/login', async (req, res) => {
 
 // ============================================================================
 // ROUTE 2: Get Active Waiting Queue for Today (Strictly Today + Auto-Cleanup)
+// Accessible by Waiting Room TV display and staff
 // ============================================================================
 app.get('/api/doctor/queue', async (req, res) => {
   try {
     const { dateStr: todaySL } = getSriLankaTodayRange();
 
-    // Futureproof Auto-Cleanup: Cancel any leftover flag=1 or flag=2 tickets from past dates
+    // Auto-Cleanup: Cancel any leftover flag=1 or flag=2 tickets from past dates
     await supabase
       .from('ticket_master')
       .update({ flag: 0 })
       .in('flag', [1, 2])
       .lt('channeling_date', todaySL);
 
-    // Strictly fetch ONLY today's active waiting queue (flag = 1 AND channeling_date = todaySL)
     const { data: tickets, error: ticketErr } = await supabase
       .from('ticket_master')
       .select('*')
@@ -267,16 +439,15 @@ app.get('/api/doctor/queue', async (req, res) => {
 });
 
 // ============================================================================
-// ROUTE 3: Server-Side Advanced Paginated Patient Search
+// ROUTE 3: Server-Side Advanced Paginated Patient Search (Protected)
 // ============================================================================
-app.get('/api/patients/search', async (req, res) => {
+app.get('/api/patients/search', requireAuth(['DOCTOR', 'COUNTER']), async (req, res) => {
   try {
     const { name, nic, phone, dob, page: pageQuery } = req.query;
     const page = parseInt(pageQuery || '1', 10);
     const limit = 15;
     const offset = (page - 1) * limit;
 
-    // If no search parameters provided, return empty
     if (!name && !nic && !phone && !dob) {
       return res.json({ data: [], page, hasMore: false });
     }
@@ -285,11 +456,9 @@ app.get('/api/patients/search', async (req, res) => {
       .from('patients_master')
       .select('id, name, reference, common, id_number, phone, birth_date, gender, weight, height, last_visit_date');
 
-    // 1. Standard Filters
     if (name) queryBuilder = queryBuilder.ilike('name', `%${name.trim()}%`);
     if (nic) queryBuilder = queryBuilder.ilike('id_number', `%${nic.trim()}%`);
 
-    // 2. Bulletproof Phone Search
     if (phone) {
       let cleanPhone = phone.trim();
       let noZero = cleanPhone.startsWith('0') ? cleanPhone.substring(1) : cleanPhone;
@@ -300,7 +469,6 @@ app.get('/api/patients/search', async (req, res) => {
       }
     }
 
-    // 3. Smart Date of Birth Search (YYYY, YYYY-MM, or YYYY-MM-DD)
     if (dob) {
       let cleanDob = dob.trim().replace(/\//g, '-');
       
@@ -332,20 +500,18 @@ app.get('/api/patients/search', async (req, res) => {
 });
 
 // ============================================================================
-// ROUTE 4: Direct Walk-In Patient Registration
+// ROUTE 4: Direct Walk-In Patient Registration (Protected + P2 Concurrency Safe)
 // ============================================================================
-app.post('/api/patients', async (req, res) => {
+app.post('/api/patients', requireAuth(['DOCTOR', 'COUNTER']), async (req, res) => {
   try {
     const { name, birth_date, phone, id_number, gender, married, common, weight, height } = req.body;
     if (!name || !name.trim()) {
       return res.status(400).json({ error: 'Patient name is required' });
     }
 
-    const nextPatientId = await getNextId('patients_master');
     const now = new Date().toISOString();
 
     const newPatient = {
-      id: nextPatientId,
       name: name.trim(),
       birth_date: birth_date || null,
       phone: phone || '',
@@ -358,17 +524,11 @@ app.post('/api/patients', async (req, res) => {
       height: height ? Number(height) : 0,
       registration_date: now,
       last_visit_date: now,
-      insert_by_id: 1,
+      insert_by_id: req.user ? req.user.id : 1,
       flag: 1
     };
 
-    const { data, error } = await supabase
-      .from('patients_master')
-      .insert([newPatient])
-      .select()
-      .single();
-
-    if (error) throw error;
+    const data = await safeInsertWithId('patients_master', newPatient);
     res.status(201).json(data);
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -376,9 +536,9 @@ app.post('/api/patients', async (req, res) => {
 });
 
 // ============================================================================
-// ROUTE 5: Load Full Patient Consultation Profile & History
+// ROUTE 5: Load Full Patient Consultation Profile & History (Protected)
 // ============================================================================
-app.get('/api/patients/:id/consultation', async (req, res) => {
+app.get('/api/patients/:id/consultation', requireAuth(['DOCTOR']), async (req, res) => {
   try {
     const patientId = Number(req.params.id);
 
@@ -450,9 +610,9 @@ app.get('/api/patients/:id/consultation', async (req, res) => {
 });
 
 // ============================================================================
-// ROUTE 6: Update "Common Details" in patients_master
+// ROUTE 6: Update "Common Details" in patients_master (Protected)
 // ============================================================================
-app.put('/api/patients/:id/common', async (req, res) => {
+app.put('/api/patients/:id/common', requireAuth(['DOCTOR']), async (req, res) => {
   try {
     const patientId = Number(req.params.id);
     const { common } = req.body;
@@ -472,9 +632,9 @@ app.put('/api/patients/:id/common', async (req, res) => {
 });
 
 // ============================================================================
-// ROUTE 7: Update "Allergies & Reports" in channeling_findings_master
+// ROUTE 7: Update "Allergies & Reports" (Protected + P2 Concurrency Safe)
 // ============================================================================
-app.put('/api/patients/:id/allergies-reports', async (req, res) => {
+app.put('/api/patients/:id/allergies-reports', requireAuth(['DOCTOR']), async (req, res) => {
   try {
     const patientId = Number(req.params.id);
     const { findings_comment, active_ticket_id, doctor_id } = req.body;
@@ -492,10 +652,8 @@ app.put('/api/patients/:id/allergies-reports', async (req, res) => {
       if (existingTickets && existingTickets.length > 0) {
         ticketId = existingTickets[0].id;
       } else {
-        ticketId = await getNextId('ticket_master');
         const today = new Date().toISOString().split('T')[0];
-        await supabase.from('ticket_master').insert([{
-          id: ticketId,
+        const newTicket = await safeInsertWithId('ticket_master', {
           number: 1,
           booking_method: 'Direct Walk-In',
           timeframe_id: 1,
@@ -507,7 +665,8 @@ app.put('/api/patients/:id/allergies-reports', async (req, res) => {
           insert_by_id: doctor_id || 1,
           insert_date: new Date().toISOString(),
           flag: 1
-        }]);
+        });
+        ticketId = newTicket.id;
       }
     }
 
@@ -526,20 +685,14 @@ app.put('/api/patients/:id/allergies-reports', async (req, res) => {
 
       if (updErr) throw updErr;
     } else {
-      const nextFindingRowId = await getNextId('channeling_findings_master');
-      const { error: insErr } = await supabase
-        .from('channeling_findings_master')
-        .insert([{
-          id: nextFindingRowId,
-          ticket_id: ticketId,
-          finding_id: 1,
-          findings_comment: findings_comment || '',
-          insert_by_id: doctor_id || 1,
-          insert_date: new Date().toISOString(),
-          flag: 1
-        }]);
-
-      if (insErr) throw insErr;
+      await safeInsertWithId('channeling_findings_master', {
+        ticket_id: ticketId,
+        finding_id: 1,
+        findings_comment: findings_comment || '',
+        insert_by_id: doctor_id || 1,
+        insert_date: new Date().toISOString(),
+        flag: 1
+      });
     }
 
     res.json({ success: true, ticket_id: ticketId, findings_comment });
@@ -549,9 +702,9 @@ app.put('/api/patients/:id/allergies-reports', async (req, res) => {
 });
 
 // ============================================================================
-// ROUTE 8: Submit Prescription ("To Counter")
+// ROUTE 8: Submit Prescription ("To Counter") (Protected + P2 Concurrency Safe)
 // ============================================================================
-app.post('/api/doctor/prescribe', async (req, res) => {
+app.post('/api/doctor/prescribe', requireAuth(['DOCTOR']), async (req, res) => {
   try {
     const { patient_id, ticket_id, general, reason_remarks, doctor_id, doctor_name, patient_name } = req.body;
 
@@ -559,7 +712,6 @@ app.post('/api/doctor/prescribe', async (req, res) => {
       return res.status(400).json({ error: 'Patient and prescription text are required.' });
     }
 
-    // 1. Build true Sri Lanka Date (YYYY-MM-DD) and Timestamp (+05:30) without .toISOString() UTC conversion
     const now = new Date();
     const slDateStr = new Intl.DateTimeFormat('en-CA', {
       timeZone: 'Asia/Colombo',
@@ -576,42 +728,25 @@ app.post('/api/doctor/prescribe', async (req, res) => {
       hour12: false
     }).format(now);
 
-    // Exact Sri Lanka timestamp for database storage (never rolls back to yesterday)
     const slTimestamp = `${slDateStr}T${slTimeStr}+05:30`;
-
     let finalTicketId = ticket_id ? Number(ticket_id) : null;
 
-    // 2. If prescribing from "Find Patient", ticket_id is null -> Generate next safe ID manually
     if (!finalTicketId) {
-      const { data: maxTicketRow } = await supabase
-        .from('ticket_master')
-        .select('id')
-        .order('id', { ascending: false })
-        .limit(1)
-        .maybeSingle();
-
-      finalTicketId = (maxTicketRow?.id ? Number(maxTicketRow.id) : 0) + 1;
-
-      const { error: createTickErr } = await supabase
-        .from('ticket_master')
-        .insert([{
-          id: finalTicketId,
-          number: finalTicketId,
-          booking_method: 'Direct Consult',
-          timeframe_id: 1,
-          patient_id: Number(patient_id),
-          channeling_date: slDateStr,
-          channeling_doctor_id: doctor_id || 1,
-          institutional_fee: 0,
-          billing_amount: 0,
-          insert_by_id: doctor_id || 1,
-          insert_date: slTimestamp,
-          flag: 2
-        }]);
-
-      if (createTickErr) throw createTickErr;
+      const newTicket = await safeInsertWithId('ticket_master', {
+        number: 1,
+        booking_method: 'Direct Consult',
+        timeframe_id: 1,
+        patient_id: Number(patient_id),
+        channeling_date: slDateStr,
+        channeling_doctor_id: doctor_id || 1,
+        institutional_fee: 0,
+        billing_amount: 0,
+        insert_by_id: doctor_id || 1,
+        insert_date: slTimestamp,
+        flag: 2
+      });
+      finalTicketId = newTicket.id;
     } else {
-      // If prescribing from Queue, update existing ticket to flag = 2 (Sent to Counter)
       const { error: updTickErr } = await supabase
         .from('ticket_master')
         .update({ flag: 2, channeling_doctor_id: doctor_id || 1 })
@@ -620,7 +755,6 @@ app.post('/api/doctor/prescribe', async (req, res) => {
       if (updTickErr) throw updTickErr;
     }
 
-    // 3. Insert or Update channeling_master with explicit ID generation
     const { data: existingChanneling } = await supabase
       .from('channeling_master')
       .select('id')
@@ -645,40 +779,21 @@ app.post('/api/doctor/prescribe', async (req, res) => {
       if (error) throw error;
       channelingRow = data;
     } else {
-      const { data: maxChanRow } = await supabase
-        .from('channeling_master')
-        .select('id')
-        .order('id', { ascending: false })
-        .limit(1)
-        .maybeSingle();
-
-      const nextChannelingId = (maxChanRow?.id ? Number(maxChanRow.id) : 0) + 1;
-
-      const { data, error } = await supabase
-        .from('channeling_master')
-        .insert([{
-          id: nextChannelingId,
-          ticket_id: finalTicketId,
-          reason_remarks: reason_remarks || '',
-          general: general.trim(),
-          insert_by_id: doctor_id || 1,
-          insert_date: slTimestamp,
-          flag: 1
-        }])
-        .select()
-        .single();
-
-      if (error) throw error;
-      channelingRow = data;
+      channelingRow = await safeInsertWithId('channeling_master', {
+        ticket_id: finalTicketId,
+        reason_remarks: reason_remarks || '',
+        general: general.trim(),
+        insert_by_id: doctor_id || 1,
+        insert_date: slTimestamp,
+        flag: 1
+      });
     }
 
-    // 4. Update patient's last visit date in Sri Lanka time
     await supabase
       .from('patients_master')
       .update({ last_visit_date: slTimestamp })
       .eq('id', Number(patient_id));
 
-    // 5. Notify Counter
     await supabase.from('counter_alerts').insert([{
       alert_type: 'NEW_PRESCRIPTION',
       doctor_id: doctor_id || 1,
@@ -696,9 +811,9 @@ app.post('/api/doctor/prescribe', async (req, res) => {
 });
 
 // ============================================================================
-// ROUTE 9: Ring Counter Bell
+// ROUTE 9: Ring Counter Bell (Protected)
 // ============================================================================
-app.post('/api/doctor/bell', async (req, res) => {
+app.post('/api/doctor/bell', requireAuth(['DOCTOR']), async (req, res) => {
   try {
     const { doctor_id, doctor_name } = req.body;
     const { data, error } = await supabase
@@ -720,9 +835,9 @@ app.post('/api/doctor/bell', async (req, res) => {
 });
 
 // ============================================================================
-// ROUTE 10: Update Marital Status in patients_master
+// ROUTE 10: Update Marital Status in patients_master (Protected)
 // ============================================================================
-app.put('/api/patients/:id/marital-status', async (req, res) => {
+app.put('/api/patients/:id/marital-status', requireAuth(['DOCTOR', 'COUNTER']), async (req, res) => {
   try {
     const patientId = Number(req.params.id);
     const { married } = req.body;
@@ -742,9 +857,26 @@ app.put('/api/patients/:id/marital-status', async (req, res) => {
 });
 
 // ============================================================================
-// COUNTER ROUTE 1: Encrypted Counter Staff Login
+// ROUTE 11: Update Gender in patients_master (Protected)
 // ============================================================================
-app.post('/api/counter/login', async (req, res) => {
+app.put('/api/patients/:id/gender', requireAuth(['DOCTOR', 'COUNTER']), async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('patients_master')
+      .update({ gender: Number(req.body.gender) })
+      .eq('id', Number(req.params.id))
+      .select().single();
+    if (error) throw error;
+    res.json({ success: true, gender: data.gender });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ============================================================================
+// COUNTER ROUTE 1: Encrypted Counter Staff Login (Rate-Limited + Issues JWT)
+// ============================================================================
+app.post('/api/counter/login', loginLimiter, async (req, res) => {
   try {
     const { username, password } = req.body;
     if (!username || !password) {
@@ -772,11 +904,19 @@ app.post('/api/counter/login', async (req, res) => {
       .update({ is_online: true })
       .eq('id', staff.id);
 
+    const token = signJWT({
+      id: staff.id,
+      name: staff.name,
+      username: staff.username,
+      role: 'COUNTER'
+    });
+
     res.json({
       id: staff.id,
       name: staff.name,
       role: staff.role,
-      username: staff.username
+      username: staff.username,
+      token
     });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -784,9 +924,9 @@ app.post('/api/counter/login', async (req, res) => {
 });
 
 // ============================================================================
-// COUNTER ROUTE 2: Fetch Active Doctor Prescriptions Sent to Counter (flag = 2)
+// COUNTER ROUTE 2: Fetch Active Prescriptions Sent to Counter (Protected)
 // ============================================================================
-app.get('/api/counter/prescriptions', async (req, res) => {
+app.get('/api/counter/prescriptions', requireAuth(['COUNTER', 'DOCTOR']), async (req, res) => {
   try {
     const { data: tickets, error: tickErr } = await supabase
       .from('ticket_master')
@@ -836,9 +976,9 @@ app.get('/api/counter/prescriptions', async (req, res) => {
 });
 
 // ============================================================================
-// COUNTER ROUTE 3: Load Medicines & Dispensary Services Catalog
+// COUNTER ROUTE 3: Load Medicines & Dispensary Services Catalog (Protected)
 // ============================================================================
-app.get('/api/counter/catalog', async (req, res) => {
+app.get('/api/counter/catalog', requireAuth(['COUNTER', 'DOCTOR', 'GRN']), async (req, res) => {
   try {
     const [{ data: medicines, error: medErr }, { data: services, error: srvErr }] = await Promise.all([
       supabase.from('medicines_master').select('*').eq('flag', 1).order('name', { ascending: true }),
@@ -858,9 +998,9 @@ app.get('/api/counter/catalog', async (req, res) => {
 });
 
 // ============================================================================
-// COUNTER ROUTE 4: Save or Auto-Update Medicine Price in Database
+// COUNTER ROUTE 4: Save or Auto-Update Medicine Price in Database (Protected)
 // ============================================================================
-app.post('/api/counter/medicines/upsert', async (req, res) => {
+app.post('/api/counter/medicines/upsert', requireAuth(['COUNTER', 'ADMIN', 'GRN']), async (req, res) => {
   try {
     const { id, name, unit_price } = req.body;
     const cleanName = (name || '').trim();
@@ -894,9 +1034,9 @@ app.post('/api/counter/medicines/upsert', async (req, res) => {
 });
 
 // ============================================================================
-// COUNTER ROUTE 5: Check & Clear Doctor Bell Alerts
+// COUNTER ROUTE 5: Check & Clear Doctor Bell Alerts (Protected)
 // ============================================================================
-app.get('/api/counter/alerts', async (req, res) => {
+app.get('/api/counter/alerts', requireAuth(['COUNTER', 'DOCTOR']), async (req, res) => {
   try {
     const { data, error } = await supabase
       .from('counter_alerts')
@@ -913,9 +1053,9 @@ app.get('/api/counter/alerts', async (req, res) => {
 });
 
 // ============================================================================
-// COUNTER ROUTE 6: Complete POS Checkout OR Outdoor Medicine Removal
+// COUNTER ROUTE 6: Complete POS Checkout OR Outdoor Medicine Removal (Protected)
 // ============================================================================
-app.post('/api/counter/checkout', async (req, res) => {
+app.post('/api/counter/checkout', requireAuth(['COUNTER']), async (req, res) => {
   try {
     const {
       ticket_ids,
@@ -946,7 +1086,6 @@ app.post('/api/counter/checkout', async (req, res) => {
 
     const dailyBillNumber = (todayCount || 0) + 1;
 
-    // Calculate RAW MEDICINE COST for the Admin Profit calculation
     const totalMedicineCost = (items_snapshot || [])
       .filter(item => item.item_type === 'MEDICINE')
       .reduce((sum, item) => sum + (Number(item.line_total) || 0), 0);
@@ -963,7 +1102,7 @@ app.post('/api/counter/checkout', async (req, res) => {
         final_total: Number(final_total) || 0,
         total_medicine_cost: totalMedicineCost,
         items_snapshot: items_snapshot || [],
-        created_by: created_by || 'Counter'
+        created_by: created_by || (req.user ? req.user.name : 'Counter')
       }])
       .select()
       .single();
@@ -977,13 +1116,12 @@ app.post('/api/counter/checkout', async (req, res) => {
 });
 
 // ============================================================================
-// COUNTER ROUTE 7: Get Today's Log with Daily Bill Numbers (#1, #2, #3...)
+// COUNTER ROUTE 7: Get Today's Log with Daily Bill Numbers (Protected)
 // ============================================================================
-app.get('/api/counter/today-log', async (req, res) => {
+app.get('/api/counter/today-log', requireAuth(['COUNTER', 'ADMIN']), async (req, res) => {
   try {
     const { startISO, endISO } = getSriLankaTodayRange();
 
-    // Fetch oldest-first to assign #1, #2, #3 accurately for today
     const { data, error } = await supabase
       .from('pharmacy_bills')
       .select('*')
@@ -993,7 +1131,6 @@ app.get('/api/counter/today-log', async (req, res) => {
 
     if (error) throw error;
 
-    // Assign daily_bill_no starting at 1, then reverse so newest is at top of table
     const numberedList = (data || [])
       .map((row, index) => ({
         ...row,
@@ -1008,9 +1145,9 @@ app.get('/api/counter/today-log', async (req, res) => {
 });
 
 // ============================================================================
-// COUNTER ROUTE 8: Add Patient to Today's Active Doctor Queue (flag = 1)
+// COUNTER ROUTE 8: Add Patient to Today's Active Doctor Queue (Protected + P2)
 // ============================================================================
-app.post('/api/counter/queue/add', async (req, res) => {
+app.post('/api/counter/queue/add', requireAuth(['COUNTER', 'DOCTOR']), async (req, res) => {
   try {
     const { patient_id, doctor_id } = req.body;
     if (!patient_id) {
@@ -1019,7 +1156,6 @@ app.post('/api/counter/queue/add', async (req, res) => {
 
     const { dateStr: todaySL } = getSriLankaTodayRange();
 
-    // Prevent accidental duplicate queue entries for the same patient today
     const { data: existingWaiting } = await supabase
       .from('ticket_master')
       .select('id, number')
@@ -1032,35 +1168,27 @@ app.post('/api/counter/queue/add', async (req, res) => {
       return res.status(400).json({ error: 'This patient is already in today\'s active waiting queue.' });
     }
 
-    // Calculate today's daily ticket number starting from 1
     const { count: todayTicketsCount } = await supabase
       .from('ticket_master')
       .select('id', { count: 'exact', head: true })
       .eq('channeling_date', todaySL);
 
     const nextDailyNumber = (todayTicketsCount || 0) + 1;
-    const nextTicketId = await getNextId('ticket_master');
 
-    const { data: newTicket, error: insErr } = await supabase
-      .from('ticket_master')
-      .insert([{
-        id: nextTicketId,
-        number: nextDailyNumber,
-        booking_method: 'Counter Queue',
-        timeframe_id: 1,
-        patient_id: Number(patient_id),
-        channeling_date: todaySL,
-        channeling_doctor_id: doctor_id || 1,
-        institutional_fee: 0,
-        billing_amount: 0,
-        insert_by_id: 1,
-        insert_date: new Date().toISOString(),
-        flag: 1
-      }])
-      .select()
-      .single();
+    const newTicket = await safeInsertWithId('ticket_master', {
+      number: nextDailyNumber,
+      booking_method: 'Counter Queue',
+      timeframe_id: 1,
+      patient_id: Number(patient_id),
+      channeling_date: todaySL,
+      channeling_doctor_id: doctor_id || 1,
+      institutional_fee: 0,
+      billing_amount: 0,
+      insert_by_id: req.user ? req.user.id : 1,
+      insert_date: new Date().toISOString(),
+      flag: 1
+    });
 
-    if (insErr) throw insErr;
     res.json({ success: true, ticket: newTicket, daily_number: nextDailyNumber });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -1068,9 +1196,9 @@ app.post('/api/counter/queue/add', async (req, res) => {
 });
 
 // ============================================================================
-// COUNTER ROUTE 9: Remove / Cancel Patient from Active Queue (Walk-Out -> flag = 0)
+// COUNTER ROUTE 9: Remove / Cancel Patient from Active Queue (Protected)
 // ============================================================================
-app.put('/api/counter/queue/:ticketId/cancel', async (req, res) => {
+app.put('/api/counter/queue/:ticketId/cancel', requireAuth(['COUNTER', 'DOCTOR']), async (req, res) => {
   try {
     const ticketId = Number(req.params.ticketId);
     const { error } = await supabase
@@ -1086,26 +1214,9 @@ app.put('/api/counter/queue/:ticketId/cancel', async (req, res) => {
 });
 
 // ============================================================================
-// ROUTE 11: Update Gender in patients_master
+// ADMIN ROUTE 1: Encrypted Admin Login (Rate-Limited + Issues JWT)
 // ============================================================================
-app.put('/api/patients/:id/gender', async (req, res) => {
-  try {
-    const { data, error } = await supabase
-      .from('patients_master')
-      .update({ gender: Number(req.body.gender) })
-      .eq('id', Number(req.params.id))
-      .select().single();
-    if (error) throw error;
-    res.json({ success: true, gender: data.gender });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// ============================================================================
-// ADMIN ROUTE 1: Encrypted Admin Login
-// ============================================================================
-app.post('/api/admin/login', async (req, res) => {
+app.post('/api/admin/login', loginLimiter, async (req, res) => {
   try {
     const { username, password } = req.body;
     if (!username || !password) return res.status(400).json({ error: 'Username and password required.' });
@@ -1122,24 +1233,35 @@ app.post('/api/admin/login', async (req, res) => {
     const isMatch = await bcrypt.compare(password, admin.password);
     if (!isMatch) return res.status(401).json({ error: 'Invalid admin credentials.' });
 
-    res.json({ id: admin.id, name: admin.name, username: admin.username, role: 'Administrator' });
+    const token = signJWT({
+      id: admin.id,
+      name: admin.name,
+      username: admin.username,
+      role: 'ADMIN'
+    });
+
+    res.json({
+      id: admin.id,
+      name: admin.name,
+      username: admin.username,
+      role: 'Administrator',
+      token
+    });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
 // ============================================================================
-// ADMIN ROUTE 2: Financial Dashboard Analytics (Powered by Postgres RPC)
+// ADMIN ROUTE 2: Financial Dashboard Analytics (Protected - Admin Only)
 // ============================================================================
-app.get('/api/admin/finance', async (req, res) => {
+app.get('/api/admin/finance', requireAuth(['ADMIN']), async (req, res) => {
   try {
     const { startDate, endDate } = req.query;
     
-    // Default to a vast range if ALL time is selected (covers 2010 to 2050)
     const startIso = startDate ? `${startDate}T00:00:00.000+05:30` : '2010-01-01T00:00:00.000+05:30';
     const endIso = endDate ? `${endDate}T23:59:59.999+05:30` : '2050-12-31T23:59:59.999+05:30';
 
-    // Execute all 3 heavy data crunching functions concurrently inside the database
     const [
       { data: finData, error: finErr },
       { data: topMeds, error: medErr },
@@ -1166,9 +1288,9 @@ app.get('/api/admin/finance', async (req, res) => {
 });
 
 // ============================================================================
-// ADMIN ROUTE 3: Patient Demographics & Age Bell Curve (Powered by Postgres RPC)
+// ADMIN ROUTE 3: Patient Demographics & Age Bell Curve (Protected - Admin Only)
 // ============================================================================
-app.get('/api/admin/demographics', async (req, res) => {
+app.get('/api/admin/demographics', requireAuth(['ADMIN']), async (req, res) => {
   try {
     const { data, error } = await supabase.rpc('get_patient_demographics');
     
@@ -1199,11 +1321,11 @@ app.get('/api/admin/demographics', async (req, res) => {
 });
 
 // ============================================================================
-// ADMIN ROUTE 4: Daily Business Spreadsheet Log (With Timezone Safety)
+// ADMIN ROUTE 4: Daily Business Spreadsheet Log (Protected - Admin Only)
 // ============================================================================
-app.get('/api/admin/daily-log', async (req, res) => {
+app.get('/api/admin/daily-log', requireAuth(['ADMIN']), async (req, res) => {
   try {
-    const { date } = req.query; // Expects YYYY-MM-DD
+    const { date } = req.query;
     if (!date) return res.status(400).json({ error: 'Date is required' });
 
     const startIso = `${date}T00:00:00.000+05:30`;
@@ -1224,9 +1346,9 @@ app.get('/api/admin/daily-log', async (req, res) => {
 });
 
 // ============================================================================
-// ADMIN ROUTE 5: Get All Registered Users (Doctors & Cashiers)
+// ADMIN ROUTE 5: Get All Registered Users (Protected - Admin Only)
 // ============================================================================
-app.get('/api/admin/users', async (req, res) => {
+app.get('/api/admin/users', requireAuth(['ADMIN']), async (req, res) => {
   try {
     const [docs, cashiers] = await Promise.all([
       supabase.from('doctors_master').select('id, name, username, specialty').eq('flag', 1),
@@ -1242,9 +1364,9 @@ app.get('/api/admin/users', async (req, res) => {
 });
 
 // ============================================================================
-// ADMIN ROUTE 6: Register New Doctor or Cashier
+// ADMIN ROUTE 6: Register New Doctor or Cashier (Protected - Admin Only)
 // ============================================================================
-app.post('/api/admin/users', async (req, res) => {
+app.post('/api/admin/users', requireAuth(['ADMIN']), async (req, res) => {
   try {
     const { role_type, name, username, password, specialty_or_role } = req.body;
     if (!name || !username || !password) return res.status(400).json({ error: 'Missing fields' });
@@ -1269,9 +1391,9 @@ app.post('/api/admin/users', async (req, res) => {
 });
 
 // ============================================================================
-// ADMIN ROUTE 7: Delete User (Soft Delete)
+// ADMIN ROUTE 7: Delete User (Protected - Admin Only)
 // ============================================================================
-app.delete('/api/admin/users/:type/:id', async (req, res) => {
+app.delete('/api/admin/users/:type/:id', requireAuth(['ADMIN']), async (req, res) => {
   try {
     const table = req.params.type === 'DOCTOR' ? 'doctors_master' : 'counter_staff_master';
     const { error } = await supabase.from(table).update({ flag: 0 }).eq('id', req.params.id);
@@ -1283,14 +1405,13 @@ app.delete('/api/admin/users/:type/:id', async (req, res) => {
 });
 
 // ============================================================================
-// GRN ROUTE 1: Universal Login (Accepts Admin, Doctor, OR Counter)
+// GRN ROUTE 1: Universal Login (Rate-Limited + Issues JWT)
 // ============================================================================
-app.post('/api/grn/login', async (req, res) => {
+app.post('/api/grn/login', loginLimiter, async (req, res) => {
   try {
     const { username, password } = req.body;
     if (!username || !password) return res.status(400).json({ error: 'Credentials required.' });
 
-    // Check all 3 tables concurrently
     const [adminRes, docRes, counterRes] = await Promise.all([
       supabase.from('admin_master').select('*').eq('username', username.trim()).eq('flag', 1).maybeSingle(),
       supabase.from('doctors_master').select('*').eq('username', username.trim()).eq('flag', 1).maybeSingle(),
@@ -1303,16 +1424,30 @@ app.post('/api/grn/login', async (req, res) => {
     const isMatch = await bcrypt.compare(password, user.password);
     if (!isMatch) return res.status(401).json({ error: 'Invalid credentials.' });
 
-    res.json({ id: user.id, name: user.name, username: user.username, access: 'GRANTED' });
+    const role = adminRes.data ? 'ADMIN' : (docRes.data ? 'DOCTOR' : 'GRN');
+    const token = signJWT({
+      id: user.id,
+      name: user.name,
+      username: user.username,
+      role
+    });
+
+    res.json({
+      id: user.id,
+      name: user.name,
+      username: user.username,
+      access: 'GRANTED',
+      token
+    });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
 // ============================================================================
-// GRN ROUTE 2: Delete/Remove Medicine from Catalog
+// GRN ROUTE 2: Delete/Remove Medicine from Catalog (Protected)
 // ============================================================================
-app.delete('/api/grn/medicines/:id', async (req, res) => {
+app.delete('/api/grn/medicines/:id', requireAuth(['GRN', 'ADMIN', 'COUNTER']), async (req, res) => {
   try {
     const { error } = await supabase.from('medicines_master').delete().eq('id', req.params.id);
     if (error) throw error;
@@ -1323,9 +1458,9 @@ app.delete('/api/grn/medicines/:id', async (req, res) => {
 });
 
 // ============================================================================
-// COUNTER SMS ROUTE: Update Patient Phone & Dispatch Dialog eSMS Receipt
+// COUNTER SMS ROUTE: Update Phone & Dispatch SMS (Rate-Limited + Protected)
 // ============================================================================
-app.post('/api/counter/send-sms', async (req, res) => {
+app.post('/api/counter/send-sms', smsLimiter, requireAuth(['COUNTER', 'ADMIN']), async (req, res) => {
   try {
     const {
       bill_id,
@@ -1344,7 +1479,6 @@ app.post('/api/counter/send-sms', async (req, res) => {
     const cleanPhone = phone.trim();
     let updatedPatientProfile = false;
 
-    // 1. Save the phone number to today's bill record
     if (bill_id) {
       await supabase
         .from('pharmacy_bills')
@@ -1352,7 +1486,6 @@ app.post('/api/counter/send-sms', async (req, res) => {
         .eq('id', bill_id);
     }
 
-    // 2. If this was a queued patient (not a walk-in), update their master profile phone too
     if (Array.isArray(ticket_ids) && ticket_ids.length > 0) {
       const { data: tickets } = await supabase
         .from('ticket_master')
@@ -1371,7 +1504,6 @@ app.post('/api/counter/send-sms', async (req, res) => {
       }
     }
 
-    // 3. Read Dialog credentials from environment variables
     const apiKey = process.env.DIALOG_SMS_API_KEY;
     const senderMask = process.env.DIALOG_SMS_MASK || 'Wellspring';
 
@@ -1383,13 +1515,11 @@ app.post('/api/counter/send-sms', async (req, res) => {
       });
     }
 
-    // Format Sri Lankan number for Dialog (e.g., 0771234567 -> 94771234567)
     let formattedPhone = cleanPhone.replace(/\D/g, '');
     if (formattedPhone.startsWith('0') && formattedPhone.length === 10) {
       formattedPhone = '94' + formattedPhone.substring(1);
     }
 
-    // Build SMS Receipt Text
     const smsMessage =
       `Wellspring Health Care\n` +
       `Bill No: #${daily_bill_no || bill_id}\n` +
@@ -1398,7 +1528,6 @@ app.post('/api/counter/send-sms', async (req, res) => {
       `Total Paid: Rs. ${Number(final_total || 0).toFixed(2)}\n` +
       `Thank you for visiting Wellspring!`;
 
-    // Build Dialog eSMS URL Campaign endpoint
     const dialogUrl =
       `https://e-sms.dialog.lk/api/v1/message-via-url/create/url-campaign` +
       `?esmsqk=${encodeURIComponent(apiKey)}` +
@@ -1406,7 +1535,6 @@ app.post('/api/counter/send-sms', async (req, res) => {
       `&source_address=${encodeURIComponent(senderMask)}` +
       `&message=${encodeURIComponent(smsMessage)}`;
 
-    // 4. Dispatch with an 8-second fail-safe timeout so the server never hangs
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 8000);
 
@@ -1419,7 +1547,6 @@ app.post('/api/counter/send-sms', async (req, res) => {
 
       const responseText = (await response.text()).trim();
 
-      // Dialog returns "1" when the message is accepted
       if (responseText === '1' || response.ok) {
         return res.json({
           success: true,
@@ -1469,6 +1596,7 @@ app.use((err, req, res, next) => {
 const server = app.listen(PORT, '0.0.0.0', () => {
   console.log(`===============================================`);
   console.log(`🚀 Wellspring Backend API running on port ${PORT}`);
+  console.log(`🔒 Security: JWT Auth + Rate Limiting Active`);
   console.log(`🌐 Health check: http://localhost:${PORT}/health`);
   console.log(`===============================================`);
 });
