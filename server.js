@@ -2,38 +2,90 @@ require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const { createClient } = require('@supabase/supabase-js');
-const bcrypt = require('bcryptjs'); // <-- NEW: Added Encryption Library
+const bcrypt = require('bcryptjs');
 
 const app = express();
 const PORT = process.env.PORT || 5000;
 
-// Strict CORS Configuration
-const allowedOrigins = [
+// Security & reverse-proxy trust for cloud platforms (Render, Railway, Fly.io, etc.)
+app.set('trust proxy', 1);
+app.disable('x-powered-by');
+
+// Flexible & secure CORS Configuration
+const rawFrontendUrl = process.env.FRONTEND_URL || '';
+const frontendOrigins = rawFrontendUrl
+  .split(',')
+  .map(url => url.trim().replace(/\/$/, ''))
+  .filter(Boolean);
+
+const defaultOrigins = [
   'http://localhost:5173',
-  process.env.FRONTEND_URL
-].filter(Boolean);
+  'http://localhost:3000',
+  'http://127.0.0.1:5173',
+  'http://127.0.0.1:3000'
+];
+
+const allowedOrigins = [...new Set([...defaultOrigins, ...frontendOrigins])];
 
 app.use(cors({
   origin: function (origin, callback) {
-    if (!origin || allowedOrigins.includes(origin)) {
-      callback(null, true);
-    } else {
-      callback(new Error('Not allowed by CORS'));
+    // Allow non-browser requests (e.g. mobile apps, curl, uptime/health check monitors)
+    if (!origin) return callback(null, true);
+
+    // If FRONTEND_URL is wildcard '*' allow all origins
+    if (rawFrontendUrl.trim() === '*') return callback(null, true);
+
+    const cleanOrigin = origin.replace(/\/$/, '');
+    if (allowedOrigins.includes(cleanOrigin)) {
+      return callback(null, true);
     }
+
+    console.warn(`[CORS Blocked] Origin: ${origin}. Allowed: ${allowedOrigins.join(', ')}`);
+    return callback(new Error(`Not allowed by CORS: ${origin}`));
   },
-  methods: ['GET', 'POST', 'PUT', 'DELETE'],
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS', 'PATCH'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With'],
   credentials: true
 }));
 
-app.use(express.json());
+app.use(express.json({ limit: '10mb' }));
+app.use(express.urlencoded({ extended: true, limit: '10mb' }));
+
+// Supabase environment variable validation
+const supabaseUrl = process.env.SUPABASE_URL;
+const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
+
+if (!supabaseUrl || !supabaseKey) {
+  console.warn('⚠️ WARNING: SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY environment variables are missing!');
+}
 
 // Initialize Supabase with SERVICE_ROLE key
 const supabase = createClient(
-  process.env.SUPABASE_URL,
-  process.env.SUPABASE_SERVICE_ROLE_KEY
+  supabaseUrl || 'https://placeholder.supabase.co',
+  supabaseKey || 'placeholder-key'
 );
 
-// Helper: Safely get next ID for legacy tables
+// ----------------------------------------------------------------------------
+// Helper Functions
+// ----------------------------------------------------------------------------
+
+// Always get current YYYY-MM-DD in Sri Lanka Time (UTC+5:30), even on cloud servers (UTC)
+function getSriLankaTodayRange() {
+  const slDateStr = new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'Asia/Colombo',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit'
+  }).format(new Date());
+
+  return {
+    dateStr: slDateStr,
+    startISO: `${slDateStr}T00:00:00.000+05:30`,
+    endISO: `${slDateStr}T23:59:59.999+05:30`
+  };
+}
+
+// Safely get next ID for legacy tables without auto-increment
 async function getNextId(tableName) {
   const { data, error } = await supabase
     .from(tableName)
@@ -44,6 +96,62 @@ async function getNextId(tableName) {
   if (error) throw error;
   return data && data.length > 0 ? Number(data[0].id) + 1 : 1;
 }
+
+// ----------------------------------------------------------------------------
+// Health Check & Root Endpoints (Required & Monitored by Render)
+// ----------------------------------------------------------------------------
+app.get('/health', (req, res) => {
+  res.status(200).json({
+    status: 'ok',
+    uptime: Math.floor(process.uptime()),
+    timestamp: new Date().toISOString()
+  });
+});
+
+app.get('/', (req, res) => {
+  res.status(200).json({
+    name: 'Wellspring Healthcare API',
+    status: 'online',
+    healthCheck: '/health',
+    timestamp: new Date().toISOString()
+  });
+});
+
+// ----------------------------------------------------------------------------
+// SYSTEM ROUTE: Public Clinic Stats & Doctor Telemetry
+// ----------------------------------------------------------------------------
+app.get('/api/system/public-stats', async (req, res) => {
+  try {
+    const { dateStr: todaySL, startISO, endISO } = getSriLankaTodayRange();
+
+    const [queueRes, dispensedRes, doctorRes] = await Promise.all([
+      supabase
+        .from('ticket_master')
+        .select('id', { count: 'exact', head: true })
+        .eq('flag', 1)
+        .eq('channeling_date', todaySL),
+      supabase
+        .from('pharmacy_bills')
+        .select('id', { count: 'exact', head: true })
+        .gte('created_at', startISO)
+        .lte('created_at', endISO),
+      supabase
+        .from('doctors_master')
+        .select('id')
+        .eq('is_online', true)
+        .eq('flag', 1)
+        .limit(1)
+    ]);
+
+    res.json({
+      queueCount: queueRes.count || 0,
+      dispensedToday: dispensedRes.count || 0,
+      isDoctorOnline: (doctorRes.data && doctorRes.data.length > 0) || false
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
 
 // ============================================================================
 // ROUTE 1: Encrypted Doctor Portal Login
@@ -100,13 +208,7 @@ app.post('/api/doctor/login', async (req, res) => {
 // ============================================================================
 app.get('/api/doctor/queue', async (req, res) => {
   try {
-    // Get exact YYYY-MM-DD in Sri Lanka Time
-    const todaySL = new Intl.DateTimeFormat('en-CA', {
-      timeZone: 'Asia/Colombo',
-      year: 'numeric',
-      month: '2-digit',
-      day: '2-digit'
-    }).format(new Date());
+    const { dateStr: todaySL } = getSriLankaTodayRange();
 
     // Futureproof Auto-Cleanup: Cancel any leftover flag=1 or flag=2 tickets from past dates
     await supabase
@@ -191,24 +293,15 @@ app.get('/api/patients/search', async (req, res) => {
 
     // 3. Smart Date of Birth Search (YYYY, YYYY-MM, or YYYY-MM-DD)
     if (dob) {
-      // Standardize slashes to dashes
       let cleanDob = dob.trim().replace(/\//g, '-');
       
       if (/^\d{4}$/.test(cleanDob)) {
-        // Just a Year (e.g., "2005") -> Jan 1 to Dec 31
         queryBuilder = queryBuilder.gte('birth_date', `${cleanDob}-01-01`).lte('birth_date', `${cleanDob}-12-31`);
-        
       } else if (/^\d{4}-\d{2}$/.test(cleanDob)) {
-        // Year and Month (e.g., "2005-12" or "2005/12")
         const [year, month] = cleanDob.split('-');
-        
-        // JS Trick: Day 0 of the next month returns the exact last day of the current month (28, 30, or 31)
         const lastDay = new Date(year, month, 0).getDate(); 
-        
         queryBuilder = queryBuilder.gte('birth_date', `${cleanDob}-01`).lte('birth_date', `${cleanDob}-${lastDay}`);
-        
       } else if (/^\d{4}-\d{2}-\d{2}$/.test(cleanDob)) {
-        // Exact Date (e.g., "1993-05-14")
         queryBuilder = queryBuilder.eq('birth_date', cleanDob);
       }
     }
@@ -228,6 +321,7 @@ app.get('/api/patients/search', async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
+
 // ============================================================================
 // ROUTE 4: Direct Walk-In Patient Registration
 // ============================================================================
@@ -271,6 +365,7 @@ app.post('/api/patients', async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
+
 // ============================================================================
 // ROUTE 5: Load Full Patient Consultation Profile & History
 // ============================================================================
@@ -443,6 +538,7 @@ app.put('/api/patients/:id/allergies-reports', async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
+
 // ============================================================================
 // ROUTE 8: Submit Prescription ("To Counter")
 // ============================================================================
@@ -589,6 +685,7 @@ app.post('/api/doctor/prescribe', async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
+
 // ============================================================================
 // ROUTE 9: Ring Counter Bell
 // ============================================================================
@@ -612,8 +709,9 @@ app.post('/api/doctor/bell', async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
+
 // ============================================================================
-// ROUTE: Update Marital Status in patients_master
+// ROUTE 10: Update Marital Status in patients_master
 // ============================================================================
 app.put('/api/patients/:id/marital-status', async (req, res) => {
   try {
@@ -633,7 +731,6 @@ app.put('/api/patients/:id/marital-status', async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
-
 
 // ============================================================================
 // COUNTER ROUTE 1: Encrypted Counter Staff Login
@@ -805,21 +902,6 @@ app.get('/api/counter/alerts', async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
-// Helper: Always get current YYYY-MM-DD in Sri Lanka Time (UTC+5:30), even on cloud servers
-function getSriLankaTodayRange() {
-  const slDateStr = new Intl.DateTimeFormat('en-CA', {
-    timeZone: 'Asia/Colombo',
-    year: 'numeric',
-    month: '2-digit',
-    day: '2-digit'
-  }).format(new Date());
-
-  return {
-    dateStr: slDateStr,
-    startISO: `${slDateStr}T00:00:00.000+05:30`,
-    endISO: `${slDateStr}T23:59:59.999+05:30`
-  };
-}
 
 // ============================================================================
 // COUNTER ROUTE 6: Complete POS Checkout OR Outdoor Medicine Removal
@@ -855,7 +937,7 @@ app.post('/api/counter/checkout', async (req, res) => {
 
     const dailyBillNumber = (todayCount || 0) + 1;
 
-    // FIX: Calculate RAW MEDICINE COST for the Admin Profit calculation
+    // Calculate RAW MEDICINE COST for the Admin Profit calculation
     const totalMedicineCost = (items_snapshot || [])
       .filter(item => item.item_type === 'MEDICINE')
       .reduce((sum, item) => sum + (Number(item.line_total) || 0), 0);
@@ -870,7 +952,7 @@ app.post('/api/counter/checkout', async (req, res) => {
         bill_status: bill_status || 'COMPLETED_BILL',
         calculated_total: Number(calculated_total) || 0,
         final_total: Number(final_total) || 0,
-        total_medicine_cost: totalMedicineCost, // Saved safely in the background!
+        total_medicine_cost: totalMedicineCost,
         items_snapshot: items_snapshot || [],
         created_by: created_by || 'Counter'
       }])
@@ -884,6 +966,7 @@ app.post('/api/counter/checkout', async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
+
 // ============================================================================
 // COUNTER ROUTE 7: Get Today's Log with Daily Bill Numbers (#1, #2, #3...)
 // ============================================================================
@@ -914,110 +997,9 @@ app.get('/api/counter/today-log', async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
-// ============================================================================
-// ROUTE 8: Submit Prescription ("To Counter")
-// ============================================================================
-app.post('/api/doctor/prescribe', async (req, res) => {
-  try {
-    const { patient_id, ticket_id, general, reason_remarks, doctor_id, doctor_name, patient_name } = req.body;
-
-    if (!patient_id || !general || !general.trim()) {
-      return res.status(400).json({ error: 'Patient and prescription text are required.' });
-    }
-
-    const now = new Date().toISOString();
-    // FIX: Force Sri Lanka Time for accurate date logging
-    const today = new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Colombo' }).format(new Date());
-    
-    let finalTicketId = ticket_id;
-
-    if (!finalTicketId) {
-      finalTicketId = await getNextId('ticket_master');
-      const { error: createTickErr } = await supabase.from('ticket_master').insert([{
-        id: finalTicketId,
-        number: finalTicketId,
-        booking_method: 'Direct Consult',
-        timeframe_id: 1,
-        patient_id: Number(patient_id),
-        channeling_date: today,
-        channeling_doctor_id: doctor_id || 1,
-        institutional_fee: 0,
-        billing_amount: 0,
-        insert_by_id: doctor_id || 1,
-        insert_date: now,
-        flag: 2 
-      }]);
-      if (createTickErr) throw createTickErr;
-    } else {
-      await supabase
-        .from('ticket_master')
-        .update({ flag: 2, channeling_doctor_id: doctor_id || 1 })
-        .eq('id', finalTicketId);
-    }
-
-    const { data: existingChanneling } = await supabase
-      .from('channeling_master')
-      .select('id')
-      .eq('ticket_id', finalTicketId)
-      .limit(1);
-
-    let channelingRow;
-
-    if (existingChanneling && existingChanneling.length > 0) {
-      const { data, error } = await supabase
-        .from('channeling_master')
-        .update({
-          general: general.trim(),
-          reason_remarks: reason_remarks || '',
-          insert_date: now,
-          flag: 1
-        })
-        .eq('id', existingChanneling[0].id)
-        .select()
-        .single();
-      if (error) throw error;
-      channelingRow = data;
-    } else {
-      const nextChannelingId = await getNextId('channeling_master');
-      const { data, error } = await supabase
-        .from('channeling_master')
-        .insert([{
-          id: nextChannelingId,
-          ticket_id: finalTicketId,
-          reason_remarks: reason_remarks || '',
-          general: general.trim(),
-          insert_by_id: doctor_id || 1,
-          insert_date: now,
-          flag: 1
-        }])
-        .select()
-        .single();
-      if (error) throw error;
-      channelingRow = data;
-    }
-
-    await supabase
-      .from('patients_master')
-      .update({ last_visit_date: now })
-      .eq('id', Number(patient_id));
-
-    await supabase.from('counter_alerts').insert([{
-      alert_type: 'NEW_PRESCRIPTION',
-      doctor_id: doctor_id || 1,
-      doctor_name: doctor_name || 'Doctor',
-      ticket_id: finalTicketId,
-      patient_name: patient_name || 'Patient',
-      message: general.trim()
-    }]);
-
-    res.json({ success: true, ticket_id: finalTicketId, channeling: channelingRow });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
 
 // ============================================================================
-// COUNTER ROUTE 9: Add Patient to Today's Active Doctor Queue (flag = 1)
+// COUNTER ROUTE 8: Add Patient to Today's Active Doctor Queue (flag = 1)
 // ============================================================================
 app.post('/api/counter/queue/add', async (req, res) => {
   try {
@@ -1077,7 +1059,7 @@ app.post('/api/counter/queue/add', async (req, res) => {
 });
 
 // ============================================================================
-// COUNTER ROUTE 10: Remove / Cancel Patient from Active Queue (Walk-Out -> flag = 0)
+// COUNTER ROUTE 9: Remove / Cancel Patient from Active Queue (Walk-Out -> flag = 0)
 // ============================================================================
 app.put('/api/counter/queue/:ticketId/cancel', async (req, res) => {
   try {
@@ -1128,7 +1110,6 @@ app.post('/api/admin/login', async (req, res) => {
 
     if (error || !admin) return res.status(401).json({ error: 'Invalid admin credentials.' });
 
-    const bcrypt = require('bcryptjs'); // FIX: Using bcryptjs
     const isMatch = await bcrypt.compare(password, admin.password);
     if (!isMatch) return res.status(401).json({ error: 'Invalid admin credentials.' });
 
@@ -1182,7 +1163,6 @@ app.get('/api/admin/demographics', async (req, res) => {
   try {
     const { data, error } = await supabase.rpc('get_patient_demographics');
     
-    // NEW: If Supabase crashes, print the exact reason to the Node.js terminal
     if (error) {
       console.error("SUPABASE RPC CRASH ERROR:", error);
       throw error;
@@ -1208,7 +1188,6 @@ app.get('/api/admin/demographics', async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
-
 
 // ============================================================================
 // ADMIN ROUTE 4: Daily Business Spreadsheet Log (With Timezone Safety)
@@ -1261,7 +1240,6 @@ app.post('/api/admin/users', async (req, res) => {
     const { role_type, name, username, password, specialty_or_role } = req.body;
     if (!name || !username || !password) return res.status(400).json({ error: 'Missing fields' });
 
-    const bcrypt = require('bcryptjs'); // FIX: Using bcryptjs
     const hashedPassword = await bcrypt.hash(password, 10);
     const table = role_type === 'DOCTOR' ? 'doctors_master' : 'counter_staff_master';
     
@@ -1303,8 +1281,6 @@ app.post('/api/grn/login', async (req, res) => {
     const { username, password } = req.body;
     if (!username || !password) return res.status(400).json({ error: 'Credentials required.' });
 
-    const bcrypt = require('bcryptjs'); // FIX: Using bcryptjs
-    
     // Check all 3 tables concurrently
     const [adminRes, docRes, counterRes] = await Promise.all([
       supabase.from('admin_master').select('*').eq('username', username.trim()).eq('flag', 1).maybeSingle(),
@@ -1329,8 +1305,6 @@ app.post('/api/grn/login', async (req, res) => {
 // ============================================================================
 app.delete('/api/grn/medicines/:id', async (req, res) => {
   try {
-    // We can safely hard-delete from the catalog because pharmacy_bills uses a JSON snapshot (items_snapshot) 
-    // that permanently preserves the name and price of the item at the time it was sold.
     const { error } = await supabase.from('medicines_master').delete().eq('id', req.params.id);
     if (error) throw error;
     res.json({ success: true });
@@ -1395,7 +1369,7 @@ app.post('/api/counter/send-sms', async (req, res) => {
     if (!apiKey) {
       return res.json({
         success: false,
-        gateway_warning: 'Phone saved, but DIALOG_SMS_API_KEY is not set in backend .env.',
+        gateway_warning: 'Phone saved, but DIALOG_SMS_API_KEY is not set in backend environment variables.',
         updatedPatientProfile
       });
     }
@@ -1462,7 +1436,38 @@ app.post('/api/counter/send-sms', async (req, res) => {
   }
 });
 
+// ----------------------------------------------------------------------------
+// 404 Catch-All Handler
+// ----------------------------------------------------------------------------
+app.use((req, res) => {
+  res.status(404).json({ error: `Not Found: ${req.method} ${req.originalUrl}` });
+});
 
-app.listen(PORT, () => {
-  console.log(`Wellspring Backend API running on http://localhost:${PORT}`);
+// ----------------------------------------------------------------------------
+// Global Error Handler
+// ----------------------------------------------------------------------------
+app.use((err, req, res, next) => {
+  console.error('Unhandled server error:', err);
+  if (err.message && err.message.startsWith('Not allowed by CORS')) {
+    return res.status(403).json({ error: err.message });
+  }
+  res.status(500).json({ error: err.message || 'Internal server error' });
+});
+
+// ----------------------------------------------------------------------------
+// Server Listener with Graceful Shutdown
+// ----------------------------------------------------------------------------
+const server = app.listen(PORT, '0.0.0.0', () => {
+  console.log(`===============================================`);
+  console.log(`🚀 Wellspring Backend API running on port ${PORT}`);
+  console.log(`🌐 Health check: http://localhost:${PORT}/health`);
+  console.log(`===============================================`);
+});
+
+process.on('SIGTERM', () => {
+  console.log('SIGTERM signal received: gracefully shutting down HTTP server...');
+  server.close(() => {
+    console.log('HTTP server closed cleanly.');
+    process.exit(0);
+  });
 });
