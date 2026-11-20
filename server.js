@@ -1000,7 +1000,7 @@ app.get('/api/counter/catalog', requireAuth(['COUNTER', 'DOCTOR', 'GRN']), async
 // ============================================================================
 // COUNTER ROUTE 4: Save or Auto-Update Medicine Price in Database (Protected)
 // ============================================================================
-app.post('/api/counter/medicines/upsert', requireAuth(['COUNTER', 'ADMIN', 'GRN']), async (req, res) => {
+app.post('/api/counter/medicines/upsert', requireAuth(['COUNTER', 'ADMIN', 'GRN', 'DOCTOR']), async (req, res) => {
   try {
     const { id, name, unit_price } = req.body;
     const cleanName = (name || '').trim();
@@ -1447,13 +1447,29 @@ app.post('/api/grn/login', loginLimiter, async (req, res) => {
 // ============================================================================
 // GRN ROUTE 2: Delete/Remove Medicine from Catalog (Protected)
 // ============================================================================
-app.delete('/api/grn/medicines/:id', requireAuth(['GRN', 'ADMIN', 'COUNTER']), async (req, res) => {
+app.delete('/api/grn/medicines/:id', requireAuth(['GRN', 'ADMIN', 'COUNTER', 'DOCTOR']), async (req, res) => {
   try {
-    const { error } = await supabase.from('medicines_master').delete().eq('id', req.params.id);
-    if (error) throw error;
-    res.json({ success: true });
+    const medId = req.params.id;
+
+    // First attempt hard delete (for newly created or unreferenced medicines)
+    const { error: delError } = await supabase.from('medicines_master').delete().eq('id', medId);
+
+    // If hard delete was blocked (e.g. PostgreSQL FK constraint violation on past prescriptions) or failed,
+    // fallback to soft-delete by setting flag = 0 (hides from active catalog and preserves prescription history)
+    if (delError) {
+      console.warn(`[GRN Medicine Delete] Hard delete blocked for medicine ID ${medId}: ${delError.message}. Performing soft-delete (flag=0)...`);
+      const { error: softError } = await supabase
+        .from('medicines_master')
+        .update({ flag: 0, updated_at: new Date().toISOString() })
+        .eq('id', medId);
+
+      if (softError) throw softError;
+    }
+
+    res.json({ success: true, message: 'Medicine removed from catalog.' });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    console.error('Error removing medicine:', err);
+    res.status(500).json({ error: err.message || 'Failed to remove medicine.' });
   }
 });
 
