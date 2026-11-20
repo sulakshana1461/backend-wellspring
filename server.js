@@ -874,6 +874,28 @@ app.put('/api/patients/:id/gender', requireAuth(['DOCTOR', 'COUNTER']), async (r
 });
 
 // ============================================================================
+// ROUTE 12: Update Phone Number in patients_master (Protected)
+// ============================================================================
+app.put('/api/patients/:id/phone', requireAuth(['DOCTOR', 'COUNTER']), async (req, res) => {
+  try {
+    const patientId = Number(req.params.id);
+    const rawPhone = (req.body.phone || '').trim();
+
+    const { data, error } = await supabase
+      .from('patients_master')
+      .update({ phone: rawPhone, updated_at: new Date().toISOString() })
+      .eq('id', patientId)
+      .select()
+      .single();
+
+    if (error) throw error;
+    res.json({ success: true, phone: data.phone });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ============================================================================
 // COUNTER ROUTE 1: Encrypted Counter Staff Login (Rate-Limited + Issues JWT)
 // ============================================================================
 app.post('/api/counter/login', loginLimiter, async (req, res) => {
