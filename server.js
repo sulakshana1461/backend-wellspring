@@ -1077,7 +1077,7 @@ app.get('/api/counter/alerts', requireAuth(['COUNTER', 'DOCTOR']), async (req, r
 // ============================================================================
 // COUNTER ROUTE 6: Complete POS Checkout OR Outdoor Medicine Removal (Protected)
 // ============================================================================
-app.post('/api/counter/checkout', requireAuth(['COUNTER']), async (req, res) => {
+app.post('/api/counter/checkout', requireAuth(['COUNTER', 'DOCTOR', 'ADMIN']), async (req, res) => {
   try {
     const {
       ticket_ids,
@@ -1112,27 +1112,37 @@ app.post('/api/counter/checkout', requireAuth(['COUNTER']), async (req, res) => 
       .filter(item => item.item_type === 'MEDICINE')
       .reduce((sum, item) => sum + (Number(item.line_total) || 0), 0);
 
-    const { data: bill, error: billErr } = await supabase
-      .from('pharmacy_bills')
-      .insert([{
-        ticket_ids: ticket_ids || [],
-        patient_names: patient_names || 'Walk-In Patient',
-        patient_phone: patient_phone || '',
-        doctor_name: doctor_name || 'Consulting Physician',
-        bill_status: bill_status || 'COMPLETED_BILL',
-        calculated_total: Number(calculated_total) || 0,
-        final_total: Number(final_total) || 0,
-        total_medicine_cost: totalMedicineCost,
-        items_snapshot: items_snapshot || [],
-        created_by: created_by || (req.user ? req.user.name : 'Counter')
-      }])
-      .select()
-      .single();
+    const billPayload = {
+      ticket_ids: ticket_ids || [],
+      patient_names: patient_names || 'Walk-In Patient',
+      patient_phone: patient_phone || '',
+      doctor_name: doctor_name || 'Consulting Physician',
+      bill_status: bill_status || 'COMPLETED_BILL',
+      calculated_total: Number(calculated_total) || 0,
+      final_total: Number(final_total) || 0,
+      total_medicine_cost: totalMedicineCost,
+      items_snapshot: items_snapshot || [],
+      created_by: created_by || (req.user ? req.user.name : 'Counter')
+    };
 
-    if (billErr) throw billErr;
+    let bill;
+    try {
+      // First attempt safeInsertWithId for tables without sequence or with collision retry
+      bill = await safeInsertWithId('pharmacy_bills', billPayload);
+    } catch (insertWithIdErr) {
+      console.warn('[Checkout] safeInsertWithId failed, falling back to direct insert:', insertWithIdErr.message);
+      const { data: stdBill, error: billErr } = await supabase
+        .from('pharmacy_bills')
+        .insert([billPayload])
+        .select()
+        .single();
+      if (billErr) throw billErr;
+      bill = stdBill;
+    }
 
     res.json({ success: true, bill: { ...bill, daily_bill_no: dailyBillNumber } });
   } catch (err) {
+    console.error('Checkout error:', err);
     res.status(500).json({ error: err.message });
   }
 });
@@ -1140,7 +1150,7 @@ app.post('/api/counter/checkout', requireAuth(['COUNTER']), async (req, res) => 
 // ============================================================================
 // COUNTER ROUTE 7: Get Today's Log with Daily Bill Numbers (Protected)
 // ============================================================================
-app.get('/api/counter/today-log', requireAuth(['COUNTER', 'ADMIN']), async (req, res) => {
+app.get('/api/counter/today-log', requireAuth(['COUNTER', 'ADMIN', 'DOCTOR']), async (req, res) => {
   try {
     const { startISO, endISO } = getSriLankaTodayRange();
 
@@ -1498,7 +1508,7 @@ app.delete('/api/grn/medicines/:id', requireAuth(['GRN', 'ADMIN', 'COUNTER', 'DO
 // ============================================================================
 // COUNTER SMS ROUTE: Update Phone & Dispatch SMS (Rate-Limited + Protected)
 // ============================================================================
-app.post('/api/counter/send-sms', smsLimiter, requireAuth(['COUNTER', 'ADMIN']), async (req, res) => {
+app.post('/api/counter/send-sms', smsLimiter, requireAuth(['COUNTER', 'ADMIN', 'DOCTOR']), async (req, res) => {
   try {
     const {
       bill_id,
