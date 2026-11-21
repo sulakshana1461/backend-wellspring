@@ -1070,14 +1070,28 @@ app.post('/api/counter/medicines/upsert', requireAuth(['COUNTER', 'ADMIN', 'GRN'
 // ============================================================================
 app.get('/api/counter/alerts', requireAuth(['COUNTER', 'DOCTOR']), async (req, res) => {
   try {
+    // Only return bell rings from the last 24 hours to prevent yesterday's bell from sounding today
+    const twentyFourHoursAgo = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+
     const { data, error } = await supabase
       .from('counter_alerts')
       .select('*')
       .eq('alert_type', 'BELL_RING')
+      .gte('created_at', twentyFourHoursAgo)
       .order('id', { ascending: false })
       .limit(1);
 
-    if (error) throw error;
+    if (error) {
+      // Fallback without timestamp filter if created_at column isn't present
+      const fallback = await supabase
+        .from('counter_alerts')
+        .select('*')
+        .eq('alert_type', 'BELL_RING')
+        .order('id', { ascending: false })
+        .limit(1);
+      return res.json(fallback.data && fallback.data.length > 0 ? fallback.data[0] : null);
+    }
+
     res.json(data && data.length > 0 ? data[0] : null);
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -1762,6 +1776,35 @@ app.use((err, req, res, next) => {
 });
 
 // ----------------------------------------------------------------------------
+// AUTOMATED MAINTENANCE: Purge Obsolete Live Alerts (> 24 hours old)
+// Strictly targets ONLY the temporary 'counter_alerts' signaling table.
+// Real patient records (channeling, patients, tickets, bills) are never touched.
+// ----------------------------------------------------------------------------
+async function cleanOldCounterAlerts() {
+  try {
+    const twentyFourHoursAgo = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+
+    const { data, error } = await supabase
+      .from('counter_alerts')
+      .delete()
+      .lt('created_at', twentyFourHoursAgo)
+      .select('id');
+
+    if (error) {
+      console.warn('[Auto-Clean] counter_alerts cleanup note:', error.message);
+    } else if (data && data.length > 0) {
+      console.log(`[Auto-Clean] Successfully purged ${data.length} obsolete alert(s) (>24h old) from counter_alerts.`);
+    }
+  } catch (err) {
+    console.warn('[Auto-Clean] Non-blocking maintenance warning:', err.message);
+  }
+}
+
+// Run initial cleanup 5 seconds after server start, then every 6 hours
+setTimeout(cleanOldCounterAlerts, 5000);
+const cleanAlertsInterval = setInterval(cleanOldCounterAlerts, 6 * 60 * 60 * 1000);
+
+// ----------------------------------------------------------------------------
 // Server Listener with Graceful Shutdown
 // ----------------------------------------------------------------------------
 const server = app.listen(PORT, '0.0.0.0', () => {
@@ -1769,11 +1812,13 @@ const server = app.listen(PORT, '0.0.0.0', () => {
   console.log(`🚀 Wellspring Backend API running on port ${PORT}`);
   console.log(`🔒 Security: JWT Auth + Rate Limiting Active`);
   console.log(`🌐 Health check: http://localhost:${PORT}/health`);
+  console.log(`🧹 Maintenance: Automatic counter_alerts purge active (every 6h)`);
   console.log(`===============================================`);
 });
 
 process.on('SIGTERM', () => {
   console.log('SIGTERM signal received: gracefully shutting down HTTP server...');
+  clearInterval(cleanAlertsInterval);
   server.close(() => {
     console.log('HTTP server closed cleanly.');
     process.exit(0);
