@@ -275,6 +275,16 @@ async function safeInsertWithId(tableName, recordData, maxRetries = 5) {
   }
 }
 
+// Generates a clean, unique, collision-resistant Auth Code (e.g. WSP-7X8K)
+function generateAuthCode() {
+  const chars = '23456789ABCDEFGHJKLMNPQRSTUVWXYZ';
+  let rand = '';
+  for (let i = 0; i < 4; i++) {
+    rand += chars.charAt(Math.floor(Math.random() * chars.length));
+  }
+  return `WSP-${rand}`;
+}
+
 // ----------------------------------------------------------------------------
 // Health Check & Root Endpoints (Required & Monitored by Render)
 // ----------------------------------------------------------------------------
@@ -1112,6 +1122,8 @@ app.post('/api/counter/checkout', requireAuth(['COUNTER', 'DOCTOR', 'ADMIN']), a
       .filter(item => item.item_type === 'MEDICINE')
       .reduce((sum, item) => sum + (Number(item.line_total) || 0), 0);
 
+    const authCode = generateAuthCode();
+
     const billPayload = {
       ticket_ids: ticket_ids || [],
       patient_names: patient_names || 'Walk-In Patient',
@@ -1122,7 +1134,8 @@ app.post('/api/counter/checkout', requireAuth(['COUNTER', 'DOCTOR', 'ADMIN']), a
       final_total: Number(final_total) || 0,
       total_medicine_cost: totalMedicineCost,
       items_snapshot: items_snapshot || [],
-      created_by: created_by || (req.user ? req.user.name : 'Counter')
+      created_by: created_by || (req.user ? req.user.name : 'Counter'),
+      auth_code: authCode
     };
 
     let bill;
@@ -1130,17 +1143,37 @@ app.post('/api/counter/checkout', requireAuth(['COUNTER', 'DOCTOR', 'ADMIN']), a
       // First attempt safeInsertWithId for tables without sequence or with collision retry
       bill = await safeInsertWithId('pharmacy_bills', billPayload);
     } catch (insertWithIdErr) {
-      console.warn('[Checkout] safeInsertWithId failed, falling back to direct insert:', insertWithIdErr.message);
-      const { data: stdBill, error: billErr } = await supabase
-        .from('pharmacy_bills')
-        .insert([billPayload])
-        .select()
-        .single();
-      if (billErr) throw billErr;
-      bill = stdBill;
+      console.warn('[Checkout] safeInsertWithId failed, checking for column compatibility:', insertWithIdErr.message);
+      const isColumnMissing = String(insertWithIdErr.message || '').includes('auth_code');
+      const payloadToUse = isColumnMissing
+        ? {
+            ...billPayload,
+            items_snapshot: [...(billPayload.items_snapshot || []), { _auth_code: authCode }]
+          }
+        : billPayload;
+      if (isColumnMissing) delete payloadToUse.auth_code;
+
+      try {
+        bill = await safeInsertWithId('pharmacy_bills', payloadToUse);
+      } catch {
+        const { data: stdBill, error: billErr } = await supabase
+          .from('pharmacy_bills')
+          .insert([payloadToUse])
+          .select()
+          .single();
+        if (billErr) throw billErr;
+        bill = stdBill;
+      }
     }
 
-    res.json({ success: true, bill: { ...bill, daily_bill_no: dailyBillNumber } });
+    res.json({
+      success: true,
+      bill: {
+        ...bill,
+        daily_bill_no: dailyBillNumber,
+        auth_code: bill.auth_code || authCode
+      }
+    });
   } catch (err) {
     console.error('Checkout error:', err);
     res.status(500).json({ error: err.message });
@@ -1433,6 +1466,96 @@ app.delete('/api/admin/users/:type/:id', requireAuth(['ADMIN']), async (req, res
     res.json({ success: true });
   } catch (err) {
     res.status(500).json({ error: err.message });
+  }
+});
+
+// ============================================================================
+// ADMIN ROUTE 8: Authenticate & Verify Bill by Auth Code (Protected)
+// ============================================================================
+app.get('/api/admin/verify-bill/:code', requireAuth(['ADMIN', 'DOCTOR', 'COUNTER']), async (req, res) => {
+  try {
+    let cleanCode = (req.params.code || '').trim().toUpperCase();
+    if (!cleanCode) {
+      return res.status(400).json({ error: 'Auth code is required.' });
+    }
+    // Allow searching '7X8K' without having to type 'WSP-'
+    if (!cleanCode.startsWith('WSP-') && cleanCode.length === 4) {
+      cleanCode = `WSP-${cleanCode}`;
+    }
+
+    let bill = null;
+
+    // 1. Primary lookup by auth_code column
+    try {
+      const { data, error } = await supabase
+        .from('pharmacy_bills')
+        .select('*')
+        .eq('auth_code', cleanCode)
+        .maybeSingle();
+      if (!error && data) bill = data;
+    } catch {
+      // Column might not exist yet
+    }
+
+    // 2. Fallback lookup in items_snapshot
+    if (!bill) {
+      const { data: recentBills } = await supabase
+        .from('pharmacy_bills')
+        .select('*')
+        .order('id', { ascending: false })
+        .limit(300);
+
+      if (recentBills && recentBills.length > 0) {
+        bill = recentBills.find(b => {
+          if (b.auth_code && b.auth_code.toUpperCase() === cleanCode) return true;
+          if (Array.isArray(b.items_snapshot)) {
+            return b.items_snapshot.some(item => item._auth_code && item._auth_code.toUpperCase() === cleanCode);
+          }
+          return false;
+        });
+      }
+    }
+
+    // 3. Fallback: If numeric ID was searched
+    if (!bill && /^\d+$/.test(cleanCode)) {
+      const { data: byId } = await supabase
+        .from('pharmacy_bills')
+        .select('*')
+        .eq('id', Number(cleanCode))
+        .maybeSingle();
+      if (byId) bill = byId;
+    }
+
+    if (!bill) {
+      return res.status(404).json({
+        verified: false,
+        code: cleanCode,
+        error: `Receipt Not Found. No clinic record matches Auth Code: ${cleanCode}`
+      });
+    }
+
+    const cleanItems = (bill.items_snapshot || []).filter(item => !item._auth_code);
+
+    res.json({
+      verified: true,
+      bill: {
+        id: bill.id,
+        auth_code: bill.auth_code || cleanCode,
+        patient_names: bill.patient_names,
+        patient_phone: bill.patient_phone || 'Not recorded',
+        doctor_name: bill.doctor_name || 'Consulting Physician',
+        bill_status: bill.bill_status,
+        calculated_total: bill.calculated_total,
+        final_total: bill.final_total,
+        total_medicine_cost: bill.total_medicine_cost,
+        items_snapshot: cleanItems,
+        created_by: bill.created_by || 'Counter',
+        created_at: bill.created_at
+      }
+    });
+  } catch (err) {
+    console.error('Verify bill error:', err);
+    res.status(500).json({ error: 'Failed to verify bill record.' });
   }
 });
 
