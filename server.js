@@ -1016,10 +1016,14 @@ app.post('/api/doctor/patients/:id/vitals', requireAuth(['DOCTOR', 'ADMIN', 'COU
 
     // Optional: update baseline weight/height in patients_master too
     if (w || h) {
-      const updates = {};
-      if (w) updates.weight = String(w);
-      if (h) updates.height = String(h);
-      await supabase.from('patients_master').update(updates).eq('id', patientId).catch(() => {});
+      try {
+        const updates = {};
+        if (w) updates.weight = String(w);
+        if (h) updates.height = String(h);
+        await supabase.from('patients_master').update(updates).eq('id', patientId);
+      } catch {
+        // non-blocking
+      }
     }
 
     res.json({ success: true, record });
