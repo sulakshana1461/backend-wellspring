@@ -918,7 +918,7 @@ const DEFAULT_INVESTIGATION_CATALOG = [
   { id: 7, investigation: 'SCR', remarks: 'Serum Creatinine' },
   { id: 8, investigation: 'UFR', remarks: 'Uroflowmetry' },
   { id: 9, investigation: 'TSH', remarks: 'Thyroid Stimulating Hormone' },
-  { id: 10, investigation: 'Thiroxing', remarks: 'Thiroxing' },
+  { id: 10, investigation: 'Thyroxine', remarks: 'Thyroxine (Free T4 / Total T4)' },
   { id: 11, investigation: 'SGPT', remarks: 'Serum Glutamic Pyruvic Transaminase' },
   { id: 12, investigation: 'Lipid Profile', remarks: 'Lipid Profile' },
   { id: 13, investigation: 'Others', remarks: 'Others' }
