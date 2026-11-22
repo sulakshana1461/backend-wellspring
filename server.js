@@ -906,6 +906,317 @@ app.put('/api/patients/:id/phone', requireAuth(['DOCTOR', 'COUNTER']), async (re
 });
 
 // ============================================================================
+// ROUTE 13: Get Investigation Catalog (Protected)
+// ============================================================================
+const DEFAULT_INVESTIGATION_CATALOG = [
+  { id: 1, investigation: 'FBC', remarks: 'Full Blood Count' },
+  { id: 2, investigation: 'FBS', remarks: 'Fasting Blood Sugar' },
+  { id: 3, investigation: 'HBA1C', remarks: 'Hemoglobin A1C' },
+  { id: 4, investigation: 'ESR', remarks: 'Erythrocyte Sedimentation Rate' },
+  { id: 5, investigation: 'CRP', remarks: 'C-Reactive Protein' },
+  { id: 6, investigation: 'BUN', remarks: 'Blood Urea Nitrogen' },
+  { id: 7, investigation: 'SCR', remarks: 'Serum Creatinine' },
+  { id: 8, investigation: 'UFR', remarks: 'Uroflowmetry' },
+  { id: 9, investigation: 'TSH', remarks: 'Thyroid Stimulating Hormone' },
+  { id: 10, investigation: 'Thiroxing', remarks: 'Thiroxing' },
+  { id: 11, investigation: 'SGPT', remarks: 'Serum Glutamic Pyruvic Transaminase' },
+  { id: 12, investigation: 'Lipid Profile', remarks: 'Lipid Profile' },
+  { id: 13, investigation: 'Others', remarks: 'Others' }
+];
+
+app.get('/api/doctor/investigation-catalog', requireAuth(['DOCTOR', 'ADMIN', 'COUNTER']), async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('investigation_master')
+      .select('id, investigation, remarks')
+      .order('id', { ascending: true });
+
+    if (error || !data || data.length === 0) {
+      return res.json(DEFAULT_INVESTIGATION_CATALOG);
+    }
+    res.json(data);
+  } catch {
+    res.json(DEFAULT_INVESTIGATION_CATALOG);
+  }
+});
+
+// ============================================================================
+// ROUTE 14: Get Patient Vitals & BMI History (Protected)
+// ============================================================================
+app.get('/api/doctor/patients/:id/vitals', requireAuth(['DOCTOR', 'ADMIN', 'COUNTER']), async (req, res) => {
+  try {
+    const patientId = Number(req.params.id);
+    const { data, error } = await supabase
+      .from('patient_vitals')
+      .select('*')
+      .eq('patient_id', patientId)
+      .order('record_date', { ascending: true })
+      .order('id', { ascending: true });
+
+    if (error) {
+      // Table might not exist yet
+      console.warn('[Vitals GET] Warning:', error.message);
+      return res.json([]);
+    }
+    res.json(data || []);
+  } catch (err) {
+    res.json([]);
+  }
+});
+
+// ============================================================================
+// ROUTE 15: Record New Patient Vitals (Protected)
+// ============================================================================
+app.post('/api/doctor/patients/:id/vitals', requireAuth(['DOCTOR', 'ADMIN', 'COUNTER']), async (req, res) => {
+  try {
+    const patientId = Number(req.params.id);
+    const {
+      record_date,
+      weight_kg,
+      height_cm,
+      systolic_bp,
+      diastolic_bp,
+      pulse_bpm,
+      notes
+    } = req.body;
+
+    const w = weight_kg ? parseFloat(weight_kg) : null;
+    const h = height_cm ? parseFloat(height_cm) : null;
+    let computedBmi = null;
+    if (w && h && h > 0) {
+      const hMeters = h / 100;
+      computedBmi = Number((w / (hMeters * hMeters)).toFixed(2));
+    }
+
+    const payload = {
+      patient_id: patientId,
+      record_date: record_date || new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Colombo' }).format(new Date()),
+      weight_kg: w,
+      height_cm: h,
+      bmi: computedBmi,
+      systolic_bp: systolic_bp ? parseInt(systolic_bp, 10) : null,
+      diastolic_bp: diastolic_bp ? parseInt(diastolic_bp, 10) : null,
+      pulse_bpm: pulse_bpm ? parseInt(pulse_bpm, 10) : null,
+      notes: notes ? String(notes).trim() : null
+    };
+
+    let record = null;
+    try {
+      const { data, error } = await supabase
+        .from('patient_vitals')
+        .insert([payload])
+        .select()
+        .single();
+      if (error) throw error;
+      record = data;
+    } catch {
+      // fallback with safeInsertWithId
+      record = await safeInsertWithId('patient_vitals', payload);
+    }
+
+    // Optional: update baseline weight/height in patients_master too
+    if (w || h) {
+      const updates = {};
+      if (w) updates.weight = String(w);
+      if (h) updates.height = String(h);
+      await supabase.from('patients_master').update(updates).eq('id', patientId).catch(() => {});
+    }
+
+    res.json({ success: true, record });
+  } catch (err) {
+    console.error('Error recording vitals:', err);
+    res.status(500).json({ error: err.message || 'Failed to save vitals.' });
+  }
+});
+
+// ============================================================================
+// ROUTE 16: Update Existing Vitals Record (Fix Errors) (Protected)
+// ============================================================================
+app.put('/api/doctor/vitals/:vitalId', requireAuth(['DOCTOR', 'ADMIN']), async (req, res) => {
+  try {
+    const vitalId = Number(req.params.vitalId);
+    const {
+      record_date,
+      weight_kg,
+      height_cm,
+      systolic_bp,
+      diastolic_bp,
+      pulse_bpm,
+      notes
+    } = req.body;
+
+    const w = weight_kg ? parseFloat(weight_kg) : null;
+    const h = height_cm ? parseFloat(height_cm) : null;
+    let computedBmi = null;
+    if (w && h && h > 0) {
+      const hMeters = h / 100;
+      computedBmi = Number((w / (hMeters * hMeters)).toFixed(2));
+    }
+
+    const updates = {
+      record_date,
+      weight_kg: w,
+      height_cm: h,
+      bmi: computedBmi,
+      systolic_bp: systolic_bp ? parseInt(systolic_bp, 10) : null,
+      diastolic_bp: diastolic_bp ? parseInt(diastolic_bp, 10) : null,
+      pulse_bpm: pulse_bpm ? parseInt(pulse_bpm, 10) : null,
+      notes: notes ? String(notes).trim() : null
+    };
+
+    const { data, error } = await supabase
+      .from('patient_vitals')
+      .update(updates)
+      .eq('id', vitalId)
+      .select()
+      .single();
+
+    if (error) throw error;
+    res.json({ success: true, record: data });
+  } catch (err) {
+    res.status(500).json({ error: err.message || 'Failed to update vitals record.' });
+  }
+});
+
+// ============================================================================
+// ROUTE 17: Delete Vitals Record (Protected)
+// ============================================================================
+app.delete('/api/doctor/vitals/:vitalId', requireAuth(['DOCTOR', 'ADMIN']), async (req, res) => {
+  try {
+    const vitalId = Number(req.params.vitalId);
+    const { error } = await supabase
+      .from('patient_vitals')
+      .delete()
+      .eq('id', vitalId);
+
+    if (error) throw error;
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message || 'Failed to delete vitals record.' });
+  }
+});
+
+// ============================================================================
+// ROUTE 18: Get Patient Lab Investigations History (Protected)
+// ============================================================================
+app.get('/api/doctor/patients/:id/investigations', requireAuth(['DOCTOR', 'ADMIN', 'COUNTER']), async (req, res) => {
+  try {
+    const patientId = Number(req.params.id);
+    const { data, error } = await supabase
+      .from('patient_investigations')
+      .select('*')
+      .eq('patient_id', patientId)
+      .order('test_date', { ascending: true })
+      .order('id', { ascending: true });
+
+    if (error) {
+      console.warn('[Investigations GET] Warning:', error.message);
+      return res.json([]);
+    }
+    res.json(data || []);
+  } catch {
+    res.json([]);
+  }
+});
+
+// ============================================================================
+// ROUTE 19: Record New Lab Investigation (Protected)
+// ============================================================================
+app.post('/api/doctor/patients/:id/investigations', requireAuth(['DOCTOR', 'ADMIN', 'COUNTER']), async (req, res) => {
+  try {
+    const patientId = Number(req.params.id);
+    const {
+      investigation_id,
+      test_name,
+      test_date,
+      results,
+      remarks
+    } = req.body;
+
+    const payload = {
+      patient_id: patientId,
+      investigation_id: investigation_id ? Number(investigation_id) : null,
+      test_name: String(test_name || 'Lab Test').trim(),
+      test_date: test_date || new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Colombo' }).format(new Date()),
+      results: typeof results === 'object' && results !== null ? results : {},
+      remarks: remarks ? String(remarks).trim() : null
+    };
+
+    let record = null;
+    try {
+      const { data, error } = await supabase
+        .from('patient_investigations')
+        .insert([payload])
+        .select()
+        .single();
+      if (error) throw error;
+      record = data;
+    } catch {
+      record = await safeInsertWithId('patient_investigations', payload);
+    }
+
+    res.json({ success: true, record });
+  } catch (err) {
+    console.error('Error saving lab investigation:', err);
+    res.status(500).json({ error: err.message || 'Failed to save lab investigation.' });
+  }
+});
+
+// ============================================================================
+// ROUTE 20: Update Existing Lab Investigation (Fix Errors) (Protected)
+// ============================================================================
+app.put('/api/doctor/investigations/:invId', requireAuth(['DOCTOR', 'ADMIN']), async (req, res) => {
+  try {
+    const invId = Number(req.params.invId);
+    const {
+      investigation_id,
+      test_name,
+      test_date,
+      results,
+      remarks
+    } = req.body;
+
+    const updates = {
+      investigation_id: investigation_id ? Number(investigation_id) : null,
+      test_name: String(test_name).trim(),
+      test_date,
+      results: typeof results === 'object' && results !== null ? results : {},
+      remarks: remarks ? String(remarks).trim() : null
+    };
+
+    const { data, error } = await supabase
+      .from('patient_investigations')
+      .update(updates)
+      .eq('id', invId)
+      .select()
+      .single();
+
+    if (error) throw error;
+    res.json({ success: true, record: data });
+  } catch (err) {
+    res.status(500).json({ error: err.message || 'Failed to update lab investigation.' });
+  }
+});
+
+// ============================================================================
+// ROUTE 21: Delete Lab Investigation Record (Protected)
+// ============================================================================
+app.delete('/api/doctor/investigations/:invId', requireAuth(['DOCTOR', 'ADMIN']), async (req, res) => {
+  try {
+    const invId = Number(req.params.invId);
+    const { error } = await supabase
+      .from('patient_investigations')
+      .delete()
+      .eq('id', invId);
+
+    if (error) throw error;
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message || 'Failed to delete lab investigation.' });
+  }
+});
+
+// ============================================================================
 // COUNTER ROUTE 1: Encrypted Counter Staff Login (Rate-Limited + Issues JWT)
 // ============================================================================
 app.post('/api/counter/login', loginLimiter, async (req, res) => {
