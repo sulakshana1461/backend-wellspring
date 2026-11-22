@@ -950,8 +950,8 @@ app.get('/api/doctor/patients/:id/vitals', requireAuth(['DOCTOR', 'ADMIN', 'COUN
       .from('patient_vitals')
       .select('*')
       .eq('patient_id', patientId)
-      .order('record_date', { ascending: true })
-      .order('id', { ascending: true });
+      .order('record_date', { ascending: false })
+      .order('id', { ascending: false });
 
     if (error) {
       // Table might not exist yet
@@ -1110,8 +1110,8 @@ app.get('/api/doctor/patients/:id/investigations', requireAuth(['DOCTOR', 'ADMIN
       .from('patient_investigations')
       .select('*')
       .eq('patient_id', patientId)
-      .order('test_date', { ascending: true })
-      .order('id', { ascending: true });
+      .order('test_date', { ascending: false })
+      .order('id', { ascending: false });
 
     if (error) {
       console.warn('[Investigations GET] Warning:', error.message);
