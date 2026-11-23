@@ -1256,6 +1256,204 @@ app.delete('/api/doctor/investigations/:invId', requireAuth(['DOCTOR', 'ADMIN'])
 });
 
 // ============================================================================
+// ROUTE 22: Doctor's Daily Clinical Log (Protected - Doctor & Admin)
+// ============================================================================
+app.get('/api/doctor/daily-log', requireAuth(['DOCTOR', 'ADMIN']), async (req, res) => {
+  try {
+    const targetDate = (req.query.date || '').trim() || new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Colombo' }).format(new Date());
+    const startIso = `${targetDate}T00:00:00.000+05:30`;
+    const endIso = `${targetDate}T23:59:59.999+05:30`;
+
+    // 1. Fetch tickets for the selected day
+    const { data: ticketsData, error: tickErr } = await supabase
+      .from('ticket_master')
+      .select('id, number, patient_id, channeling_date, insert_date, flag, channeling_doctor_id')
+      .eq('channeling_date', targetDate)
+      .order('id', { ascending: true });
+
+    if (tickErr) throw tickErr;
+    let tickets = ticketsData || [];
+
+    // 2. Fetch channeling (prescription) records for these tickets
+    const ticketIds = tickets.map(t => t.id);
+    let channelings = [];
+    if (ticketIds.length > 0) {
+      const { data: chanData, error: chanErr } = await supabase
+        .from('channeling_master')
+        .select('id, ticket_id, general, reason_remarks, insert_date, insert_by_id')
+        .in('ticket_id', ticketIds)
+        .order('id', { ascending: true });
+      if (!chanErr && chanData) channelings = chanData;
+    }
+
+    // Also check any channeling records inserted on this date
+    const { data: dateChannelings } = await supabase
+      .from('channeling_master')
+      .select('id, ticket_id, general, reason_remarks, insert_date, insert_by_id')
+      .gte('insert_date', startIso)
+      .lte('insert_date', endIso);
+
+    const allChannelingsMap = {};
+    (channelings || []).forEach(c => { allChannelingsMap[c.ticket_id] = c; });
+    const additionalTicketIds = [];
+    (dateChannelings || []).forEach(c => {
+      if (!allChannelingsMap[c.ticket_id]) {
+        allChannelingsMap[c.ticket_id] = c;
+        if (!ticketIds.includes(c.ticket_id)) additionalTicketIds.push(c.ticket_id);
+      }
+    });
+
+    if (additionalTicketIds.length > 0) {
+      const { data: extraTickets } = await supabase
+        .from('ticket_master')
+        .select('id, number, patient_id, channeling_date, insert_date, flag, channeling_doctor_id')
+        .in('id', additionalTicketIds);
+      if (extraTickets) tickets = [...tickets, ...extraTickets];
+    }
+
+    // 3. Fetch patient profiles
+    const patientIds = [...new Set(tickets.map(t => t.patient_id).filter(Boolean))];
+    let patients = [];
+    if (patientIds.length > 0) {
+      const { data: patData } = await supabase
+        .from('patients_master')
+        .select('id, name, phone, gender, birth_date, id_number')
+        .in('id', patientIds);
+      if (patData) patients = patData;
+    }
+    const patMap = {};
+    patients.forEach(p => { patMap[p.id] = p; });
+
+    // 4. Fetch pharmacy bills for today's revenue & status
+    const { data: billsData } = await supabase
+      .from('pharmacy_bills')
+      .select('*')
+      .gte('created_at', startIso)
+      .lte('created_at', endIso)
+      .order('id', { ascending: true });
+    const bills = billsData || [];
+
+    const ticketToBillMap = {};
+    const matchedBillIds = new Set();
+    bills.forEach(b => {
+      if (Array.isArray(b.ticket_ids)) {
+        b.ticket_ids.forEach(tId => {
+          ticketToBillMap[tId] = b;
+        });
+      }
+    });
+
+    // 5. Build consolidated rows
+    const rows = [];
+    const processedTickets = new Set();
+
+    tickets.forEach(t => {
+      if (processedTickets.has(t.id)) return;
+      processedTickets.add(t.id);
+
+      const chan = allChannelingsMap[t.id] || {};
+      const pat = patMap[t.patient_id] || {};
+      const bill = ticketToBillMap[t.id] || null;
+      if (bill) matchedBillIds.add(bill.id);
+
+      const isOutdoor = bill?.bill_status === 'OUTDOOR_RX';
+      const rev = bill ? (isOutdoor ? 0 : Number(bill.final_total || 0)) : 0;
+
+      let status = 'WAITING';
+      if (bill) {
+        status = isOutdoor ? 'OUTDOOR_RX' : 'COMPLETED_BILL';
+      } else if (t.flag === 2) {
+        status = 'AT_COUNTER';
+      } else if (chan.general) {
+        status = 'PRESCRIBED';
+      }
+
+      rows.push({
+        id: `ticket-${t.id}`,
+        ticket_id: t.id,
+        ticket_number: t.number || t.id,
+        time: chan.insert_date || t.insert_date || startIso,
+        patient_id: pat.id || t.patient_id,
+        patient_name: pat.name || bill?.patient_names || 'Patient',
+        patient_phone: pat.phone || bill?.patient_phone || '',
+        gender: pat.gender !== undefined && pat.gender !== null ? Number(pat.gender) : null,
+        birth_date: pat.birth_date || null,
+        id_number: pat.id_number || '',
+        prescription: chan.general || '',
+        remarks: chan.reason_remarks || '',
+        bill_id: bill?.id || null,
+        daily_bill_no: bill?.daily_bill_no || null,
+        bill_status: status,
+        revenue: rev,
+        auth_code: bill?.auth_code || ''
+      });
+    });
+
+    // Also include any standalone bills created on that day
+    bills.forEach(b => {
+      if (!matchedBillIds.has(b.id)) {
+        const isOutdoor = b.bill_status === 'OUTDOOR_RX';
+        const rev = isOutdoor ? 0 : Number(b.final_total || 0);
+        const medRx = (b.items_snapshot || [])
+          .filter(i => i.item_type === 'MEDICINE')
+          .map(i => `${i.item_name} × ${i.quantity}`)
+          .join(', ');
+
+        rows.push({
+          id: `bill-${b.id}`,
+          ticket_id: Array.isArray(b.ticket_ids) && b.ticket_ids.length > 0 ? b.ticket_ids[0] : null,
+          ticket_number: b.daily_bill_no || b.id,
+          time: b.created_at,
+          patient_id: null,
+          patient_name: b.patient_names || 'Walk-In Patient',
+          patient_phone: b.patient_phone || '',
+          gender: null,
+          birth_date: null,
+          id_number: '',
+          prescription: medRx || 'Direct Counter Dispense',
+          remarks: '',
+          bill_id: b.id,
+          daily_bill_no: b.daily_bill_no || b.id,
+          bill_status: b.bill_status,
+          revenue: rev,
+          auth_code: b.auth_code || ''
+        });
+      }
+    });
+
+    // Chronological ordering
+    rows.sort((a, b) => new Date(a.time) - new Date(b.time));
+
+    rows.forEach((r, idx) => {
+      r.index = idx + 1;
+    });
+
+    const totalRevenue = bills
+      .filter(b => b.bill_status !== 'OUTDOOR_RX')
+      .reduce((sum, b) => sum + Number(b.final_total || 0), 0);
+
+    const totalPatients = rows.length;
+    const paidBillsCount = bills.filter(b => b.bill_status === 'COMPLETED_BILL').length;
+    const outdoorCount = bills.filter(b => b.bill_status === 'OUTDOOR_RX').length;
+
+    res.json({
+      success: true,
+      date: targetDate,
+      summary: {
+        totalPatients,
+        totalRevenue,
+        paidBillsCount,
+        outdoorCount
+      },
+      records: rows
+    });
+  } catch (err) {
+    console.error('Doctor Daily Log Error:', err.message);
+    res.status(500).json({ error: err.message || 'Failed to load doctor daily log.' });
+  }
+});
+
+// ============================================================================
 // COUNTER ROUTE 1: Encrypted Counter Staff Login (Rate-Limited + Issues JWT)
 // ============================================================================
 app.post('/api/counter/login', loginLimiter, async (req, res) => {
