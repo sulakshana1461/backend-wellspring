@@ -959,7 +959,7 @@ const DEFAULT_INVESTIGATION_CATALOG = [
   { id: 13, investigation: 'Others', remarks: 'Others' }
 ];
 
-app.get('/api/doctor/investigation-catalog', requireAuth(['DOCTOR', 'ADMIN', 'COUNTER']), async (req, res) => {
+app.get('/api/doctor/investigation-catalog', async (req, res) => {
   try {
     const { data, error } = await supabase
       .from('investigation_master')
