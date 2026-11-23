@@ -464,7 +464,7 @@ app.get('/api/patients/search', requireAuth(['DOCTOR', 'COUNTER']), async (req, 
 
     let queryBuilder = supabase
       .from('patients_master')
-      .select('id, name, reference, common, id_number, phone, birth_date, gender, weight, height, last_visit_date');
+      .select('id, name, reference, common, id_number, phone, birth_date, gender, married, weight, height, last_visit_date');
 
     if (name) queryBuilder = queryBuilder.ilike('name', `%${name.trim()}%`);
     if (nic) queryBuilder = queryBuilder.ilike('id_number', `%${nic.trim()}%`);
@@ -901,6 +901,42 @@ app.put('/api/patients/:id/phone', requireAuth(['DOCTOR', 'COUNTER']), async (re
     if (error) throw error;
     res.json({ success: true, phone: data.phone });
   } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ============================================================================
+// ROUTE 12B: Update Demographic Details in patients_master (Protected - Counter & Doctor)
+// ============================================================================
+app.put('/api/patients/:id/demographics', requireAuth(['DOCTOR', 'COUNTER']), async (req, res) => {
+  try {
+    const patientId = Number(req.params.id);
+    const { name, birth_date, phone, id_number, gender, married } = req.body;
+
+    if (name !== undefined && !name.trim()) {
+      return res.status(400).json({ error: 'Patient full name cannot be empty.' });
+    }
+
+    const updates = {};
+    if (name !== undefined) updates.name = name.trim();
+    if (birth_date !== undefined) updates.birth_date = birth_date || null;
+    if (phone !== undefined) updates.phone = (phone || '').trim();
+    if (id_number !== undefined) updates.id_number = (id_number || '').trim();
+    if (gender !== undefined && gender !== '') updates.gender = Number(gender);
+    if (married !== undefined && married !== '') updates.married = Number(married);
+    updates.updated_at = new Date().toISOString();
+
+    const { data, error } = await supabase
+      .from('patients_master')
+      .update(updates)
+      .eq('id', patientId)
+      .select('id, name, birth_date, phone, id_number, gender, married, weight, height')
+      .single();
+
+    if (error) throw error;
+    res.json({ success: true, patient: data });
+  } catch (err) {
+    console.error('Update Demographics Error:', err.message);
     res.status(500).json({ error: err.message });
   }
 });
