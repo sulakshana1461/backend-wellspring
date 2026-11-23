@@ -893,7 +893,7 @@ app.put('/api/patients/:id/phone', requireAuth(['DOCTOR', 'COUNTER']), async (re
 
     const { data, error } = await supabase
       .from('patients_master')
-      .update({ phone: rawPhone, updated_at: new Date().toISOString() })
+      .update({ phone: rawPhone })
       .eq('id', patientId)
       .select()
       .single();
@@ -924,7 +924,6 @@ app.put('/api/patients/:id/demographics', requireAuth(['DOCTOR', 'COUNTER']), as
     if (id_number !== undefined) updates.id_number = (id_number || '').trim();
     if (gender !== undefined && gender !== '') updates.gender = Number(gender);
     if (married !== undefined && married !== '') updates.married = Number(married);
-    updates.updated_at = new Date().toISOString();
 
     const { data, error } = await supabase
       .from('patients_master')
