@@ -233,6 +233,25 @@ function getSriLankaTodayRange() {
   };
 }
 
+// Strict YYYY-MM-DD calendar date validation (leap-year safe, prevents MM/DD swaps)
+function isValidIsoDate(dateStr) {
+  if (!dateStr || typeof dateStr !== 'string') return false;
+  const match = dateStr.trim().match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (!match) return false;
+  const year = parseInt(match[1], 10);
+  const month = parseInt(match[2], 10);
+  const day = parseInt(match[3], 10);
+  if (year < 1850 || year > 2100 || month < 1 || month > 12) return false;
+  let maxDay = 31;
+  if (month === 2) {
+    const isLeap = (year % 4 === 0 && year % 100 !== 0) || year % 400 === 0;
+    maxDay = isLeap ? 29 : 28;
+  } else if ([4, 6, 9, 11].includes(month)) {
+    maxDay = 30;
+  }
+  return day >= 1 && day <= maxDay;
+}
+
 // Safely get next ID for legacy tables without auto-increment
 async function getNextId(tableName) {
   const { data, error } = await supabase
@@ -481,14 +500,22 @@ app.get('/api/patients/search', requireAuth(['DOCTOR', 'COUNTER']), async (req, 
 
     if (dob) {
       let cleanDob = dob.trim().replace(/\//g, '-');
-      
+
       if (/^\d{4}$/.test(cleanDob)) {
         queryBuilder = queryBuilder.gte('birth_date', `${cleanDob}-01-01`).lte('birth_date', `${cleanDob}-12-31`);
       } else if (/^\d{4}-\d{2}$/.test(cleanDob)) {
-        const [year, month] = cleanDob.split('-');
-        const lastDay = new Date(year, month, 0).getDate(); 
-        queryBuilder = queryBuilder.gte('birth_date', `${cleanDob}-01`).lte('birth_date', `${cleanDob}-${lastDay}`);
+        const [yearStr, monthStr] = cleanDob.split('-');
+        const yearNum = parseInt(yearStr, 10);
+        const monthNum = parseInt(monthStr, 10);
+        if (monthNum < 1 || monthNum > 12) {
+          return res.json({ data: [], page, hasMore: false });
+        }
+        const lastDay = new Date(Date.UTC(yearNum, monthNum, 0)).getUTCDate();
+        queryBuilder = queryBuilder.gte('birth_date', `${cleanDob}-01`).lte('birth_date', `${cleanDob}-${String(lastDay).padStart(2, '0')}`);
       } else if (/^\d{4}-\d{2}-\d{2}$/.test(cleanDob)) {
+        if (!isValidIsoDate(cleanDob)) {
+          return res.json({ data: [], page, hasMore: false });
+        }
         queryBuilder = queryBuilder.eq('birth_date', cleanDob);
       }
     }
@@ -519,11 +546,16 @@ app.post('/api/patients', requireAuth(['DOCTOR', 'COUNTER']), async (req, res) =
       return res.status(400).json({ error: 'Patient name is required' });
     }
 
+    const cleanBirthDate = birth_date ? String(birth_date).trim() : null;
+    if (cleanBirthDate && !isValidIsoDate(cleanBirthDate)) {
+      return res.status(400).json({ error: 'Invalid Date of Birth format. Please use YYYY-MM-DD.' });
+    }
+
     const now = new Date().toISOString();
 
     const newPatient = {
       name: name.trim(),
-      birth_date: birth_date || null,
+      birth_date: cleanBirthDate,
       phone: phone || '',
       id_number: id_number || '',
       reference: '',
@@ -919,7 +951,13 @@ app.put('/api/patients/:id/demographics', requireAuth(['DOCTOR', 'COUNTER']), as
 
     const updates = {};
     if (name !== undefined) updates.name = name.trim();
-    if (birth_date !== undefined) updates.birth_date = birth_date || null;
+    if (birth_date !== undefined) {
+      const cleanBirthDate = birth_date ? String(birth_date).trim() : null;
+      if (cleanBirthDate && !isValidIsoDate(cleanBirthDate)) {
+        return res.status(400).json({ error: 'Invalid Date of Birth format. Please use YYYY-MM-DD.' });
+      }
+      updates.birth_date = cleanBirthDate;
+    }
     if (phone !== undefined) updates.phone = (phone || '').trim();
     if (id_number !== undefined) updates.id_number = (id_number || '').trim();
     if (gender !== undefined && gender !== '') updates.gender = Number(gender);
