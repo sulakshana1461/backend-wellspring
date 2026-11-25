@@ -413,6 +413,15 @@ app.post('/api/doctor/login', loginLimiter, async (req, res) => {
   }
 });
 
+function sortQueueTickets(tickets) {
+  return [...(tickets || [])].sort((a, b) => {
+    const orderA = a.queue_order !== null && a.queue_order !== undefined ? Number(a.queue_order) : Number.MAX_SAFE_INTEGER;
+    const orderB = b.queue_order !== null && b.queue_order !== undefined ? Number(b.queue_order) : Number.MAX_SAFE_INTEGER;
+    if (orderA !== orderB) return orderA - orderB;
+    return Number(a.id) - Number(b.id);
+  });
+}
+
 // ============================================================================
 // ROUTE 2: Get Active Waiting Queue for Today (Strictly Today + Auto-Cleanup)
 // Accessible by Waiting Room TV display and staff
@@ -439,7 +448,9 @@ app.get('/api/doctor/queue', async (req, res) => {
     if (ticketErr) throw ticketErr;
     if (!tickets || tickets.length === 0) return res.json([]);
 
-    const patientIds = [...new Set(tickets.map(t => t.patient_id).filter(Boolean))];
+    const orderedTickets = sortQueueTickets(tickets);
+
+    const patientIds = [...new Set(orderedTickets.map(t => t.patient_id).filter(Boolean))];
     const { data: patients, error: patErr } = await supabase
       .from('patients_master')
       .select('id, name, phone, birth_date, gender, married, common, reference, id_number, weight, height')
@@ -450,11 +461,13 @@ app.get('/api/doctor/queue', async (req, res) => {
     const patientMap = {};
     (patients || []).forEach(p => { patientMap[p.id] = p; });
 
-    const queue = tickets
+    const queue = orderedTickets
       .map((t, idx) => ({
         ticket_id: t.id,
         daily_queue_no: idx + 1,
         ticket_number: t.number || idx + 1,
+        queue_order: t.queue_order ?? idx + 1,
+        booking_method: t.booking_method || 'Counter Queue',
         channeling_date: t.channeling_date,
         insert_date: t.insert_date,
         patient: patientMap[t.patient_id] || null
@@ -1833,14 +1846,26 @@ app.post('/api/counter/queue/add', requireAuth(['COUNTER', 'DOCTOR']), async (re
       return res.status(400).json({ error: 'This patient is already in today\'s active waiting queue.' });
     }
 
-    const { count: todayTicketsCount } = await supabase
-      .from('ticket_master')
-      .select('id', { count: 'exact', head: true })
-      .eq('channeling_date', todaySL);
+    const [{ count: todayTicketsCount }, { data: activeWaitingRows }] = await Promise.all([
+      supabase
+        .from('ticket_master')
+        .select('id', { count: 'exact', head: true })
+        .eq('channeling_date', todaySL),
+      supabase
+        .from('ticket_master')
+        .select('*')
+        .eq('channeling_date', todaySL)
+        .eq('flag', 1)
+    ]);
 
     const nextDailyNumber = (todayTicketsCount || 0) + 1;
+    const maxWaitingOrder = (activeWaitingRows || []).reduce(
+      (max, row) => Math.max(max, Number(row.queue_order || 0)),
+      0
+    );
+    const nextQueueOrder = Math.max(maxWaitingOrder, (activeWaitingRows || []).length) + 1;
 
-    const newTicket = await safeInsertWithId('ticket_master', {
+    const baseTicketPayload = {
       number: nextDailyNumber,
       booking_method: 'Counter Queue',
       timeframe_id: 1,
@@ -1852,9 +1877,86 @@ app.post('/api/counter/queue/add', requireAuth(['COUNTER', 'DOCTOR']), async (re
       insert_by_id: req.user ? req.user.id : 1,
       insert_date: new Date().toISOString(),
       flag: 1
-    });
+    };
+
+    let newTicket;
+    try {
+      newTicket = await safeInsertWithId('ticket_master', {
+        ...baseTicketPayload,
+        queue_order: nextQueueOrder
+      });
+    } catch (insertErr) {
+      if (String(insertErr.message || '').includes('queue_order')) {
+        newTicket = await safeInsertWithId('ticket_master', baseTicketPayload);
+      } else {
+        throw insertErr;
+      }
+    }
 
     res.json({ success: true, ticket: newTicket, daily_number: nextDailyNumber });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ============================================================================
+// COUNTER ROUTE 8B: Reorder Today's Active Waiting Queue (Protected)
+// ============================================================================
+app.put('/api/counter/queue/reorder', requireAuth(['COUNTER', 'DOCTOR']), async (req, res) => {
+  try {
+    const { ordered_ticket_ids } = req.body;
+    if (!Array.isArray(ordered_ticket_ids) || ordered_ticket_ids.length === 0) {
+      return res.status(400).json({ error: 'ordered_ticket_ids must be a non-empty array.' });
+    }
+
+    const cleanOrderedIds = [...new Set(ordered_ticket_ids.map(Number).filter(n => Number.isInteger(n) && n > 0))];
+    if (cleanOrderedIds.length === 0) {
+      return res.status(400).json({ error: 'No valid ticket IDs provided.' });
+    }
+
+    const { dateStr: todaySL } = getSriLankaTodayRange();
+
+    // Fetch current waiting tickets in case another patient joined concurrently
+    const { data: currentWaiting, error: fetchErr } = await supabase
+      .from('ticket_master')
+      .select('id')
+      .eq('channeling_date', todaySL)
+      .eq('flag', 1)
+      .order('id', { ascending: true });
+
+    if (fetchErr) throw fetchErr;
+
+    const currentWaitingSet = new Set((currentWaiting || []).map(t => t.id));
+    const finalOrder = cleanOrderedIds.filter(id => currentWaitingSet.has(id));
+
+    for (const row of currentWaiting || []) {
+      if (!finalOrder.includes(row.id)) {
+        finalOrder.push(row.id);
+      }
+    }
+
+    const updates = await Promise.all(
+      finalOrder.map((ticketId, idx) =>
+        supabase
+          .from('ticket_master')
+          .update({ queue_order: idx + 1 })
+          .eq('id', ticketId)
+          .eq('channeling_date', todaySL)
+          .eq('flag', 1)
+      )
+    );
+
+    const firstError = updates.find(u => u.error)?.error;
+    if (firstError) {
+      if (String(firstError.message || '').includes('queue_order')) {
+        return res.status(400).json({
+          error: 'Database column queue_order is missing. Run in Supabase SQL Editor: ALTER TABLE ticket_master ADD COLUMN IF NOT EXISTS queue_order INTEGER;'
+        });
+      }
+      throw firstError;
+    }
+
+    res.json({ success: true, ordered_ticket_ids: finalOrder });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
