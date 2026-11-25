@@ -1917,6 +1917,69 @@ app.post('/api/admin/login', loginLimiter, async (req, res) => {
   }
 });
 
+// Aggregates ALL medicines dispensed across pharmacy_bills in [startIso, endIso], sorted most -> least
+async function fetchAllDispensedMedicines(startIso, endIso) {
+  const medMap = new Map();
+  const batchSize = 1000;
+  let offset = 0;
+
+  while (true) {
+    const { data: billsBatch, error } = await supabase
+      .from('pharmacy_bills')
+      .select('bill_status, items_snapshot')
+      .gte('created_at', startIso)
+      .lte('created_at', endIso)
+      .order('id', { ascending: true })
+      .range(offset, offset + batchSize - 1);
+
+    if (error) throw error;
+    if (!billsBatch || billsBatch.length === 0) break;
+
+    for (const bill of billsBatch) {
+      if (bill.bill_status === 'OUTDOOR_RX') continue;
+      const items = Array.isArray(bill.items_snapshot) ? bill.items_snapshot : [];
+      for (const item of items) {
+        if (!item || item._auth_code) continue;
+        if (item.item_type !== 'MEDICINE') continue;
+
+        const rawName = String(item.name || '').trim();
+        if (!rawName) continue;
+
+        const qty = Number(item.qty ?? item.quantity ?? 0);
+        if (!Number.isFinite(qty) || qty <= 0) continue;
+
+        const lineTotal = Number(item.line_total || 0);
+        const key = rawName.toLowerCase();
+        const existing = medMap.get(key);
+        if (existing) {
+          existing.total_sold += qty;
+          existing.total_revenue += Number.isFinite(lineTotal) ? lineTotal : 0;
+          existing.bill_count += 1;
+        } else {
+          medMap.set(key, {
+            name: rawName,
+            total_sold: qty,
+            total_revenue: Number.isFinite(lineTotal) ? lineTotal : 0,
+            bill_count: 1
+          });
+        }
+      }
+    }
+
+    if (billsBatch.length < batchSize) break;
+    offset += batchSize;
+  }
+
+  return Array.from(medMap.values())
+    .map(m => ({
+      ...m,
+      total_sold: Math.round(m.total_sold * 100) / 100,
+      total_revenue: Math.round(m.total_revenue * 100) / 100
+    }))
+    .filter(m => m.total_sold > 0)
+    .sort((a, b) => (b.total_sold - a.total_sold) || a.name.localeCompare(b.name));
+}
+
 // ============================================================================
 // ADMIN ROUTE 2: Financial Dashboard Analytics (Protected - Admin Only)
 // ============================================================================
@@ -1929,11 +1992,13 @@ app.get('/api/admin/finance', requireAuth(['ADMIN']), async (req, res) => {
 
     const [
       { data: finData, error: finErr },
-      { data: topMeds, error: medErr },
+      { data: topMedsRpc, error: medErr },
+      allDispensedMeds,
       { data: traffic, error: trafErr }
     ] = await Promise.all([
       supabase.rpc('get_financial_metrics', { start_d: startIso, end_d: endIso }),
       supabase.rpc('get_top_medicines', { start_d: startIso, end_d: endIso }),
+      fetchAllDispensedMedicines(startIso, endIso),
       supabase.rpc('get_weekly_traffic', { start_d: startIso, end_d: endIso })
     ]);
 
@@ -1941,10 +2006,12 @@ app.get('/api/admin/finance', requireAuth(['ADMIN']), async (req, res) => {
     if (medErr) throw medErr;
     if (trafErr) throw trafErr;
 
+    const topMedicines = allDispensedMeds.length > 0 ? allDispensedMeds : (topMedsRpc || []);
+
     res.json({
       summary: finData.summary,
       chartData: finData.daily,
-      topMedicines: topMeds,
+      topMedicines,
       weeklyTraffic: traffic
     });
   } catch (err) {
